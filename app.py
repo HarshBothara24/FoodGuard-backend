@@ -26,7 +26,7 @@ app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 jwt = JWTManager(app)
 
 # MongoDB Configuration
-MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb://localhost:27017/foodguard')
+MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://harshbothara9656:Harsh9656@foodguard.rrppplb.mongodb.net/foodguard?retryWrites=true&w=majority')
 client = pymongo.MongoClient(MONGODB_URI)
 db = client['foodguard']
 
