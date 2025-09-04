@@ -310,6 +310,19 @@ def save_scan_to_history(user_id, detected_ingredients, allergen_warnings, is_sa
     result = scan_history_collection.insert_one(scan_doc)
     return str(result.inserted_id)
 
+
+@app.route('/')
+def health_check():
+    """Health check endpoint for Render and keep-alive"""
+    return jsonify({
+        'status': 'healthy',
+        'message': 'FoodGuard API backend is running',
+        'models_loaded': len(models_pipeline),
+        'mongodb_connected': True,
+        'yolov8_available': any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline),
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
 # Authentication Routes
 @app.route('/api/auth/register', methods=['POST'])
 def register():
