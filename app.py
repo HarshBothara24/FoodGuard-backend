@@ -1,18 +1,17 @@
-# app.py - Multi-Model Pipeline with YOLOv8 best.pt Integration
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
-import torchvision.models as torch_models
-from ultralytics import YOLO  # Added for YOLOv8
+from ultralytics import YOLO
 from PIL import Image
 import numpy as np
 import pickle
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, create_access_token
-from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
+import pymongo
+from bson.objectid import ObjectId
 import uuid
 import os
 import time
@@ -20,17 +19,26 @@ import time
 app = Flask(__name__)
 CORS(app)
 
-# Configuration
-app.config['JWT_SECRET_KEY'] = 'your-super-secret-jwt-key-change-in-production'
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///foodguard.db')
+# Production Configuration
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'your-super-secret-jwt-key-change-in-production')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 
-# Handle PostgreSQL URL format for Render
-db_url = app.config['SQLALCHEMY_DATABASE_URI']
-if db_url and db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
-    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 jwt = JWTManager(app)
-db = SQLAlchemy(app)
+
+# MongoDB Configuration
+MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb://localhost:27017/foodguard')
+client = pymongo.MongoClient(MONGODB_URI)
+db = client['foodguard']
+
+# Collections
+users_collection = db['users']
+allergies_collection = db['allergies']
+scan_history_collection = db['scan_history']
+
+# Create indexes for better performance
+users_collection.create_index("email", unique=True)
+allergies_collection.create_index("user_id")
+scan_history_collection.create_index("user_id")
 
 # Global variables for multi-model pipeline
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -248,7 +256,163 @@ def multi_model_predict(image, confidence_threshold=0.3):
     
     return detected_ingredients[:25]  # Top 25 ingredients
 
-# Enhanced analyze_food endpoint with YOLOv8
+# MongoDB Helper Functions
+def get_user_allergies(user_id):
+    """Get user allergies from MongoDB"""
+    allergies = list(allergies_collection.find({"user_id": user_id}))
+    return allergies
+
+def save_scan_to_history(user_id, detected_ingredients, allergen_warnings, is_safe, confidence_score):
+    """Save scan to MongoDB history"""
+    scan_doc = {
+        "user_id": user_id,
+        "detected_ingredients": detected_ingredients,
+        "allergen_warnings": allergen_warnings,
+        "is_safe": is_safe,
+        "confidence_score": confidence_score,
+        "created_at": datetime.utcnow()
+    }
+    result = scan_history_collection.insert_one(scan_doc)
+    return str(result.inserted_id)
+
+# Authentication Routes
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    
+    required_fields = ['email', 'password', 'first_name', 'last_name']
+    if not all(field in data for field in required_fields):
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    if len(data['password']) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    
+    email = data['email'].lower()
+    if users_collection.find_one({"email": email}):
+        return jsonify({'error': 'Email already registered'}), 409
+    
+    try:
+        user_doc = {
+            "email": email,
+            "password_hash": generate_password_hash(data['password']),
+            "first_name": data['first_name'].strip(),
+            "last_name": data['last_name'].strip(),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+            "is_active": True
+        }
+        
+        result = users_collection.insert_one(user_doc)
+        user_id = str(result.inserted_id)
+        
+        access_token = create_access_token(identity=user_id)
+        
+        return jsonify({
+            'message': 'Account created successfully',
+            'access_token': access_token,
+            'user': {
+                'id': user_id,
+                'email': email,
+                'first_name': data['first_name'],
+                'last_name': data['last_name']
+            }
+        }), 201
+        
+    except Exception as e:
+        return jsonify({'error': 'Registration failed'}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    
+    if not all(k in data for k in ['email', 'password']):
+        return jsonify({'error': 'Missing email or password'}), 400
+    
+    email = data['email'].lower()
+    user = users_collection.find_one({"email": email, "is_active": True})
+    
+    if user and check_password_hash(user['password_hash'], data['password']):
+        access_token = create_access_token(identity=str(user['_id']))
+        return jsonify({
+            'access_token': access_token,
+            'user': {
+                'id': str(user['_id']),
+                'email': user['email'],
+                'first_name': user['first_name'],
+                'last_name': user['last_name']
+            }
+        })
+    
+    return jsonify({'error': 'Invalid email or password'}), 401
+
+@app.route('/api/profile', methods=['GET'])
+@jwt_required()
+def get_profile():
+    user_id = get_jwt_identity()
+    
+    try:
+        user = users_collection.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Get user allergies
+        allergies = list(allergies_collection.find({"user_id": user_id}))
+        allergy_list = [{
+            'name': allergy['allergen_name'], 
+            'severity': allergy['severity'], 
+            'notes': allergy.get('notes', '')
+        } for allergy in allergies]
+        
+        # Get scan count
+        total_scans = scan_history_collection.count_documents({"user_id": user_id})
+        
+        return jsonify({
+            'user': {
+                'id': str(user['_id']),
+                'email': user['email'],
+                'first_name': user['first_name'],
+                'last_name': user['last_name'],
+                'created_at': user['created_at'].isoformat()
+            },
+            'allergies': allergy_list,
+            'total_scans': total_scans
+        })
+        
+    except Exception as e:
+        return jsonify({'error': 'Failed to get profile'}), 500
+
+@app.route('/api/profile/allergies', methods=['POST'])
+@jwt_required()
+def update_allergies():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    
+    if 'allergies' not in data:
+        return jsonify({'error': 'Missing allergies data'}), 400
+    
+    try:
+        # Clear existing allergies
+        allergies_collection.delete_many({"user_id": user_id})
+        
+        # Add new allergies
+        for allergy_data in data['allergies']:
+            if 'name' not in allergy_data:
+                continue
+                
+            allergy_doc = {
+                "user_id": user_id,
+                "allergen_name": allergy_data['name'].lower().strip(),
+                "severity": allergy_data.get('severity', 'moderate'),
+                "notes": allergy_data.get('notes', ''),
+                "created_at": datetime.utcnow()
+            }
+            allergies_collection.insert_one(allergy_doc)
+        
+        return jsonify({'message': 'Allergies updated successfully'})
+        
+    except Exception as e:
+        return jsonify({'error': 'Failed to update allergies'}), 500
+
 @app.route('/api/analyze-food', methods=['POST'])
 @jwt_required()
 def analyze_food():
@@ -265,8 +429,8 @@ def analyze_food():
         return jsonify({'error': 'No image selected'}), 400
     
     try:
-        # Load user's allergies
-        user_allergies = UserAllergy.query.filter_by(user_id=user_id).all()
+        # Load user's allergies from MongoDB
+        user_allergies = get_user_allergies(user_id)
         
         # Save temporary image for YOLOv8 processing
         temp_filename = f"temp_{user_id}_{int(time.time())}.jpg"
@@ -296,7 +460,7 @@ def analyze_food():
             ingredient_name_lower = ingredient['name'].lower()
             
             for user_allergy in user_allergies:
-                allergen_lower = user_allergy.allergen_name.lower()
+                allergen_lower = user_allergy['allergen_name'].lower()
                 
                 # Enhanced matching for paneer/dairy
                 paneer_variants = ['paneer', 'cottage cheese', 'indian cheese', 'fresh cheese']
@@ -305,10 +469,10 @@ def analyze_food():
                 # Check for paneer variants
                 if allergen_lower == 'paneer' and any(variant in ingredient_name_lower for variant in paneer_variants):
                     allergen_warnings.append({
-                        'allergen': user_allergy.allergen_name,
+                        'allergen': user_allergy['allergen_name'],
                         'ingredient': ingredient['name'],
                         'confidence': ingredient['confidence'],
-                        'severity': user_allergy.severity,
+                        'severity': user_allergy['severity'],
                         'match_type': 'paneer_variant',
                         'bbox': ingredient.get('bbox'),
                         'detection_method': ingredient.get('detection_type', 'unknown')
@@ -318,10 +482,10 @@ def analyze_food():
                 # Check for dairy terms
                 if any(dairy_term in allergen_lower for dairy_term in dairy_terms) and 'paneer' in ingredient_name_lower:
                     allergen_warnings.append({
-                        'allergen': user_allergy.allergen_name,
+                        'allergen': user_allergy['allergen_name'],
                         'ingredient': ingredient['name'],
                         'confidence': ingredient['confidence'],
-                        'severity': user_allergy.severity,
+                        'severity': user_allergy['severity'],
                         'match_type': 'dairy_match',
                         'bbox': ingredient.get('bbox'),
                         'detection_method': ingredient.get('detection_type', 'unknown')
@@ -334,10 +498,10 @@ def analyze_food():
                     any(word in ingredient_name_lower.split() for word in allergen_lower.split())):
                     
                     allergen_warnings.append({
-                        'allergen': user_allergy.allergen_name,
+                        'allergen': user_allergy['allergen_name'],
                         'ingredient': ingredient['name'],
                         'confidence': ingredient['confidence'],
-                        'severity': user_allergy.severity,
+                        'severity': user_allergy['severity'],
                         'match_type': 'standard',
                         'bbox': ingredient.get('bbox'),
                         'detection_method': ingredient.get('detection_type', 'unknown')
@@ -358,19 +522,17 @@ def analyze_food():
         # Count YOLOv8 detections
         yolo_detections = len([ing for ing in detected_ingredients if ing.get('detection_type') == 'object_detection'])
         
-        # Save scan to history
-        scan = ScanHistory(
+        # Save scan to MongoDB history
+        scan_id = save_scan_to_history(
             user_id=user_id,
             detected_ingredients=detected_ingredients,
             allergen_warnings=allergen_warnings,
             is_safe=len(allergen_warnings) == 0,
             confidence_score=float(avg_confidence)
         )
-        db.session.add(scan)
-        db.session.commit()
         
         return jsonify({
-            'scan_id': scan.id,
+            'scan_id': scan_id,
             'ingredients': detected_ingredients,
             'allergen_warnings': allergen_warnings,
             'is_safe': len(allergen_warnings) == 0,
@@ -386,7 +548,42 @@ def analyze_food():
         print(f"Multi-model analysis error: {e}")
         return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
 
-# Pipeline status endpoint
+@app.route('/api/scan-history', methods=['GET'])
+@jwt_required()
+def get_scan_history():
+    user_id = get_jwt_identity()
+    page = request.args.get('page', 1, type=int)
+    per_page = min(request.args.get('per_page', 10, type=int), 50)
+    
+    skip = (page - 1) * per_page
+    
+    # Get scans with pagination
+    scans_cursor = scan_history_collection.find({"user_id": user_id}) \
+        .sort("created_at", -1) \
+        .skip(skip) \
+        .limit(per_page)
+    
+    scans = list(scans_cursor)
+    total = scan_history_collection.count_documents({"user_id": user_id})
+    
+    scan_history = [{
+        'id': str(scan['_id']),
+        'ingredients': scan.get('detected_ingredients', []),
+        'warnings': scan.get('allergen_warnings', []),
+        'is_safe': scan.get('is_safe', True),
+        'confidence': scan.get('confidence_score', 0.0),
+        'created_at': scan['created_at'].isoformat()
+    } for scan in scans]
+    
+    return jsonify({
+        'scans': scan_history,
+        'total': total,
+        'pages': (total + per_page - 1) // per_page,
+        'current_page': page,
+        'has_next': skip + per_page < total,
+        'has_prev': page > 1
+    })
+
 @app.route('/api/pipeline-status', methods=['GET'])
 def pipeline_status():
     return jsonify({
@@ -403,220 +600,45 @@ def pipeline_status():
         'yolov8_available': any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline)
     })
 
-# Database Models (same as before)
-class User(db.Model):
-    __tablename__ = 'users'
-    
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
-    first_name = db.Column(db.String(50), nullable=False)
-    last_name = db.Column(db.String(50), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    is_active = db.Column(db.Boolean, default=True)
-    
-    allergies = db.relationship('UserAllergy', backref='user', lazy=True, cascade='all, delete-orphan')
-    scan_history = db.relationship('ScanHistory', backref='user', lazy=True, cascade='all, delete-orphan')
-
-class UserAllergy(db.Model):
-    __tablename__ = 'user_allergies'
-    
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
-    allergen_name = db.Column(db.String(100), nullable=False)
-    severity = db.Column(db.String(20), default='moderate')
-    notes = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    __table_args__ = (db.UniqueConstraint('user_id', 'allergen_name'),)
-
-class ScanHistory(db.Model):
-    __tablename__ = 'scan_history'
-    
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
-    image_filename = db.Column(db.String(255))
-    detected_ingredients = db.Column(db.JSON)
-    allergen_warnings = db.Column(db.JSON)
-    is_safe = db.Column(db.Boolean)
-    confidence_score = db.Column(db.Float)
-    scan_location = db.Column(db.String(100))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-# Authentication endpoints (add these if missing)
-@app.route('/api/auth/register', methods=['POST'])
-def register():
-    data = request.get_json()
-    
-    required_fields = ['email', 'password', 'first_name', 'last_name']
-    if not all(field in data for field in required_fields):
-        return jsonify({'error': 'Missing required fields'}), 400
-    
-    if len(data['password']) < 6:
-        return jsonify({'error': 'Password must be at least 6 characters'}), 400
-    
-    if User.query.filter_by(email=data['email'].lower()).first():
-        return jsonify({'error': 'Email already registered'}), 409
-    
-    try:
-        user = User(
-            email=data['email'].lower(),
-            password_hash=generate_password_hash(data['password']),
-            first_name=data['first_name'].strip(),
-            last_name=data['last_name'].strip()
-        )
-        
-        db.session.add(user)
-        db.session.commit()
-        
-        access_token = create_access_token(identity=user.id)
-        
-        return jsonify({
-            'message': 'Account created successfully',
-            'access_token': access_token,
-            'user': {
-                'id': user.id,
-                'email': user.email,
-                'first_name': user.first_name,
-                'last_name': user.last_name
-            }
-        }), 201
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': 'Registration failed'}), 500
-
-@app.route('/api/auth/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    
-    if not all(k in data for k in ['email', 'password']):
-        return jsonify({'error': 'Missing email or password'}), 400
-    
-    user = User.query.filter_by(email=data['email'].lower(), is_active=True).first()
-    
-    if user and check_password_hash(user.password_hash, data['password']):
-        access_token = create_access_token(identity=user.id)
-        return jsonify({
-            'access_token': access_token,
-            'user': {
-                'id': user.id,
-                'email': user.email,
-                'first_name': user.first_name,
-                'last_name': user.last_name
-            }
-        })
-    
-    return jsonify({'error': 'Invalid email or password'}), 401
-
-@app.route('/api/profile', methods=['GET'])
-@jwt_required()
-def get_profile():
-    user_id = get_jwt_identity()
-    user = db.session.get(User, user_id)  # Updated for SQLAlchemy 2.0
-    
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
-    allergies = [{
-        'name': allergy.allergen_name, 
-        'severity': allergy.severity, 
-        'notes': allergy.notes
-    } for allergy in user.allergies]
-    
+@app.route('/api/health', methods=['GET'])
+def health_check():
     return jsonify({
-        'user': {
-            'id': user.id,
-            'email': user.email,
-            'first_name': user.first_name,
-            'last_name': user.last_name,
-            'created_at': user.created_at.isoformat()
-        },
-        'allergies': allergies,
-        'total_scans': len(user.scan_history)
-    })
-
-@app.route('/api/profile/allergies', methods=['POST'])
-@jwt_required()
-def update_allergies():
-    user_id = get_jwt_identity()
-    data = request.get_json()
-    
-    if 'allergies' not in data:
-        return jsonify({'error': 'Missing allergies data'}), 400
-    
-    try:
-        UserAllergy.query.filter_by(user_id=user_id).delete()
-        
-        for allergy_data in data['allergies']:
-            if 'name' not in allergy_data:
-                continue
-                
-            allergy = UserAllergy(
-                user_id=user_id,
-                allergen_name=allergy_data['name'].lower().strip(),
-                severity=allergy_data.get('severity', 'moderate'),
-                notes=allergy_data.get('notes', '')
-            )
-            db.session.add(allergy)
-        
-        db.session.commit()
-        return jsonify({'message': 'Allergies updated successfully'})
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': 'Failed to update allergies'}), 500
-
-@app.route('/api/scan-history', methods=['GET'])
-@jwt_required()
-def get_scan_history():
-    user_id = get_jwt_identity()
-    page = request.args.get('page', 1, type=int)
-    per_page = min(request.args.get('per_page', 10, type=int), 50)
-    
-    scans = ScanHistory.query.filter_by(user_id=user_id)\
-        .order_by(ScanHistory.created_at.desc())\
-        .paginate(page=page, per_page=per_page, error_out=False)
-    
-    return jsonify({
-        'scans': [{
-            'id': scan.id,
-            'ingredients': scan.detected_ingredients or [],
-            'warnings': scan.allergen_warnings or [],
-            'is_safe': scan.is_safe,
-            'confidence': scan.confidence_score,
-            'created_at': scan.created_at.isoformat()
-        } for scan in scans.items],
-        'total': scans.total,
-        'pages': scans.pages,
-        'current_page': page,
-        'has_next': scans.has_next,
-        'has_prev': scans.has_prev
+        'status': 'healthy',
+        'mongodb_connected': client.admin.command('ping')['ok'] == 1,
+        'models_loaded': len(models_pipeline),
+        'timestamp': datetime.utcnow().isoformat()
     })
 
 def initialize_app():
-    """Initialize database tables and load YOLOv8 multi-model pipeline"""
-    with app.app_context():
-        db.create_all()
+    """Initialize MongoDB connections and load YOLOv8 multi-model pipeline"""
+    try:
+        # Test MongoDB connection
+        client.admin.command('ping')
+        print("✅ MongoDB connection successful")
+        
+        # Load models
         pipeline_loaded = load_multi_model_pipeline()
         
         if pipeline_loaded:
-            print("🚀 YOLOv8-Enhanced FoodGuard API Server initialized successfully!")
+            print("🚀 YOLOv8-Enhanced FoodGuard API Server with MongoDB initialized successfully!")
         else:
             print("⚠️  Server started but YOLOv8 model may not be loaded.")
+            
+    except Exception as e:
+        print(f"❌ Initialization error: {e}")
 
 if __name__ == '__main__':
     initialize_app()
     
-    print("🍽️ YOLOv8-Enhanced FoodGuard API Server Starting...")
-    print("📝 Required model files:")
-    print("   - food_detectors/paneer_mint_yolov8/weights/best.pt (YOLOv8 model)")
-    print("   - food_detector.pth (fallback general model - optional)")
-    print("   - pytorch_ingredients.pkl (fallback ingredients - optional)")
+    print("🍽️ MongoDB-Enhanced FoodGuard API Server Starting...")
+    print("📝 Required files:")
+    print("   - best.pt (YOLOv8 model)")
+    print("   - MongoDB connection string in MONGODB_URI environment variable")
     print()
     print("🎯 YOLOv8 Model Performance: mAP50 = 76.8%")
     print("🔍 Detection capabilities: Paneer + Mint with bounding boxes")
+    print("🍃 Database: MongoDB with collections: users, allergies, scan_history")
     print()
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
