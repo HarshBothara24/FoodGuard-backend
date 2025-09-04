@@ -1,0 +1,21 @@
+# Flask & API
+flask==2.3.3
+flask-cors==4.0.0
+flask-jwt-extended==4.5.2
+gunicorn>=21.2.0
+
+# MongoDB
+pymongo==4.5.0
+dnspython>=2.4.2
+
+# ML Dependencies
+ultralytics==8.0.196
+torch>=2.0.0,<2.1.0
+torchvision>=0.15.0,<0.16.0
+pillow>=9.5.0
+numpy>=1.24.0,<1.25.0
+opencv-python-headless>=4.8.0
+
+# Utilities  
+python-dotenv>=1.0.0
+requests>=2.31.0

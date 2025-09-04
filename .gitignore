@@ -1,0 +1,55 @@
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+.ENV/
+
+# Flask instance folder (for config, uploads, etc.)
+instance/
+*.db
+*.sqlite3
+
+# Environment variables
+.env
+*.env
+
+# Logs
+*.log
+logs/
+*.out
+
+# Coverage and testing
+.coverage
+coverage/
+htmlcov/
+.tox/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Mac/Linux system files
+.DS_Store
+Thumbs.db
