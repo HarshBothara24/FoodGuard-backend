@@ -10,35 +10,70 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, create_access_token
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
-import pymongo
-from bson.objectid import ObjectId
 import uuid
 import os
 import time
+import sys
+
+# MongoDB imports with URL parsing
+import pymongo
+from bson import ObjectId
+from urllib.parse import urlparse, urlunparse, quote_plus
 
 app = Flask(__name__)
 CORS(app)
 
 # Production Configuration
-app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'your-super-secret-jwt-key-change-in-production')
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'your-super-secret-jwt-key')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 
 jwt = JWTManager(app)
 
-# MongoDB Configuration
-MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb+srv://harshbothara9656:Harsh9656@foodguard.rrppplb.mongodb.net/foodguard?retryWrites=true&w=majority')
-client = pymongo.MongoClient(MONGODB_URI)
+# MongoDB Configuration with URL encoding fix
+def create_mongodb_client():
+    """Create MongoDB client with properly encoded credentials"""
+    try:
+        raw_uri = os.environ.get('MONGODB_URI')
+        if not raw_uri:
+            raise Exception("MONGODB_URI environment variable not set")
+        
+        parsed = urlparse(raw_uri)
+        username = quote_plus(parsed.username) if parsed.username else ""
+        password = quote_plus(parsed.password) if parsed.password else ""
+        
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        netloc = f"{username}:{password}@{host}{port}"
+        
+        encoded_uri = urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+        
+        print(f"🔗 Connecting to MongoDB...")
+        client = pymongo.MongoClient(encoded_uri)
+        client.admin.command('ping')
+        print("✅ MongoDB connection successful")
+        return client
+        
+    except Exception as e:
+        print(f"❌ MongoDB connection failed: {e}")
+        raise
+
+# Create MongoDB client
+client = create_mongodb_client()
 db = client['foodguard']
 
 # Collections
 users_collection = db['users']
-allergies_collection = db['allergies']
+allergies_collection = db['allergies'] 
 scan_history_collection = db['scan_history']
 
 # Create indexes for better performance
-users_collection.create_index("email", unique=True)
-allergies_collection.create_index("user_id")
-scan_history_collection.create_index("user_id")
+try:
+    users_collection.create_index("email", unique=True)
+    allergies_collection.create_index("user_id")
+    scan_history_collection.create_index("user_id")
+    print("✅ MongoDB indexes created")
+except Exception as e:
+    print(f"⚠️ Index creation warning: {e}")
 
 # Global variables for multi-model pipeline
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
