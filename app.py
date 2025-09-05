@@ -7,7 +7,7 @@ import numpy as np
 import pickle
 import requests
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, create_access_token
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -27,7 +27,44 @@ from urllib.parse import urlparse, urlunparse, quote_plus
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+
+# Enhanced CORS Configuration for Production
+CORS_ORIGINS = [
+    "https://foodguard-eight.vercel.app",  # Your Vercel deployment
+    "https://foodguard-frontend.vercel.app",  # Alternative Vercel URLs
+    "http://localhost:3000",  # Local development
+    "http://127.0.0.1:3000",  # Alternative local
+    "https://localhost:3000"  # HTTPS local
+]
+
+# Temporary CORS fix for testing (use specific origins in production)
+CORS(app, 
+     origins=["*"],  # Allow all origins temporarily
+     allow_headers=["Content-Type", "Authorization", "Accept"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     supports_credentials=False  # Set to False when using origins=["*"]
+)
+
+# Add explicit OPTIONS handler for preflight requests
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "*")
+        response.headers.add('Access-Control-Allow-Methods', "*")
+        return response
+
+# Add response headers for all requests
+@app.after_request
+def after_request(response):
+    origin = request.headers.get('Origin')
+    if origin in CORS_ORIGINS:
+        response.headers.add('Access-Control-Allow-Origin', origin)
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
