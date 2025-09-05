@@ -5,6 +5,8 @@ from ultralytics import YOLO
 from PIL import Image
 import numpy as np
 import pickle
+import requests
+from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, create_access_token
@@ -15,6 +17,7 @@ import os
 import time
 import sys
 from dotenv import load_dotenv
+import logging
 
 # MongoDB imports with URL parsing
 import pymongo
@@ -26,9 +29,11 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+
 # Production Configuration
 app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'your-super-secret-jwt-key')
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 
 jwt = JWTManager(app)
 
@@ -81,6 +86,99 @@ except Exception as e:
 # Global variables for multi-model pipeline
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 models_pipeline = []
+mlb_encoder = None  # Global MLB encoder
+
+# Model URLs Configuration - ALL 4 FILES
+MODEL_URLS = {
+    'yolov8': os.environ.get('YOLOV8_MODEL_URL', 'https://github.com/HarshBothara24/FoodGuard-backend/releases/download/download/best.pt'),
+    'food_detector': os.environ.get('FOOD_DETECTOR_MODEL_URL', 'https://github.com/HarshBothara24/FoodGuard-backend/releases/download/download/food_detector.pth'),
+    'ingredients_list': os.environ.get('INGREDIENTS_LIST_URL', 'https://github.com/HarshBothara24/FoodGuard-backend/releases/download/download/pytorch_ingredients.pkl'),
+    'label_binarizer': os.environ.get('MLB_MODEL_URL', 'https://github.com/HarshBothara24/FoodGuard-backend/releases/download/download/mlb.pkl')
+}
+
+# Local paths where all files will be saved
+MODEL_PATHS = {
+    'yolov8': 'best.pt',
+    'food_detector': 'food_detector.pth', 
+    'ingredients_list': 'pytorch_ingredients.pkl',
+    'label_binarizer': 'mlb.pkl'
+}
+
+def download_model_file(url, local_path, model_name):
+    """Download a single model file from GitHub with progress tracking"""
+    if os.path.exists(local_path):
+        file_size = os.path.getsize(local_path)
+        print(f"✅ {model_name} already exists locally ({file_size/1024/1024:.1f}MB)")
+        return True
+    
+    try:
+        print(f"📥 Downloading {model_name} from GitHub...")
+        print(f"URL: {url}")
+        
+        # Create directory if it doesn't exist
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        # Download with progress tracking
+        response = requests.get(url, stream=True, timeout=300)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        
+        with open(local_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    if total_size > 0:
+                        progress = (downloaded / total_size) * 100
+                        print(f"📊 {model_name} progress: {progress:.1f}%", end='\r')
+        
+        file_size = os.path.getsize(local_path)
+        print(f"\n✅ {model_name} downloaded successfully ({file_size/1024/1024:.1f}MB)")
+        
+        # Basic integrity check
+        if file_size < 1024:  # Less than 1KB suggests error
+            print(f"❌ {model_name} file seems corrupted (too small)")
+            os.remove(local_path)
+            return False
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Failed to download {model_name}: {e}")
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        return False
+
+def download_all_models():
+    """Download all required models from GitHub"""
+    print("🚀 Starting model downloads from GitHub...")
+    
+    success_count = 0
+    total_models = len(MODEL_URLS)
+    
+    for model_key, url in MODEL_URLS.items():
+        local_path = MODEL_PATHS[model_key]
+        model_name = model_key.replace('_', ' ').title()
+        
+        if download_model_file(url, local_path, model_name):
+            success_count += 1
+        else:
+            print(f"💥 Failed to download {model_name}")
+    
+    print(f"\n📊 Download Summary: {success_count}/{total_models} models downloaded")
+    
+    if success_count == total_models:
+        print("🎉 All models downloaded successfully!")
+        return True
+    elif success_count > 0:
+        print("⚠️  Some models downloaded, continuing with available models...")
+        return True
+    else:
+        print("❌ No models downloaded successfully!")
+        return False
 
 # YOLOv8 Paneer Detector Class
 class YOLOv8PaneerDetector:
@@ -102,7 +200,7 @@ class YOLOv8PaneerDetector:
         """Detect paneer and mint in image using YOLOv8"""
         try:
             # Run inference
-            results = self.model(image)
+            results = self.model(image, verbose=False)
             
             detected_ingredients = []
             
@@ -142,77 +240,115 @@ class FoodAllergenDetector(nn.Module):
         return torch.sigmoid(self.backbone(x))
 
 def load_multi_model_pipeline():
-    """Load multiple models with YOLOv8 as primary paneer detector"""
-    global models_pipeline
+    """Load all models including MLB label decoder after downloading from GitHub"""
+    global models_pipeline, mlb_encoder
     
     try:
+        # First, download all models from GitHub
+        if not download_all_models():
+            print("💥 Model download failed, but continuing with any available models...")
+        
         models_pipeline = []
+        mlb_encoder = None
         
-        # Model 1: YOLOv8 Paneer & Mint Detector (PRIMARY)
-        yolov8_model_path = "best.pt"  
+        # Load MLB Label Binarizer (CRITICAL for decoding)
+        mlb_path = MODEL_PATHS['label_binarizer']
+        if os.path.exists(mlb_path):
+            try:
+                print(f"🏷️ Loading label binarizer from: {mlb_path}")
+                with open(mlb_path, 'rb') as f:
+                    mlb_encoder = pickle.load(f)
+                print(f"✅ Label binarizer loaded with {len(mlb_encoder.classes_)} classes")
+            except Exception as e:
+                print(f"❌ Failed to load MLB: {e}")
+                print("⚠️  Continuing without MLB decoder...")
         
-        # Try multiple possible paths
-        possible_paths = [
-            yolov8_model_path,
-            "best.pt",
-            "food_detectors/paneer_mint_yolov8/weights/best.pt",
-            os.path.join("food_detectors", "paneer_mint_yolov8", "weights", "best.pt")
-        ]
+        # Model 1: YOLOv8 Paneer Detector (PRIMARY)
+        yolov8_path = MODEL_PATHS['yolov8']
         
-        model_loaded = False
-        for path in possible_paths:
-            if os.path.exists(path):
-                try:
-                    yolov8_detector = YOLOv8PaneerDetector(path, confidence_threshold=0.5)
-                    
-                    models_pipeline.append({
-                        'name': 'yolov8_paneer_detector',
-                        'model': yolov8_detector,
-                        'ingredients': ['paneer', 'mint'],
-                        'weight': 1.0,  # Primary model gets full weight
-                        'specialty': 'yolov8_paneer'
-                    })
-                    
-                    print(f"✅ YOLOv8 Paneer Detector loaded from: {path}")
-                    model_loaded = True
-                    break
-                    
-                except Exception as e:
-                    print(f"❌ Failed to load YOLOv8 from {path}: {e}")
-                    continue
+        if os.path.exists(yolov8_path):
+            try:
+                print(f"🥛 Loading YOLOv8 model from: {yolov8_path}")
+                yolov8_detector = YOLOv8PaneerDetector(yolov8_path, confidence_threshold=0.5)
+                
+                # Test the model with a dummy inference
+                print("🧪 Testing YOLOv8 model...")
+                dummy_img = Image.new('RGB', (640, 640), color='white')
+                test_results = yolov8_detector.detect_ingredients(dummy_img)
+                print(f"✅ YOLOv8 test successful: {len(test_results)} detections")
+                
+                models_pipeline.append({
+                    'name': 'yolov8_paneer_detector',
+                    'model': yolov8_detector,
+                    'ingredients': ['paneer', 'mint'],
+                    'weight': 1.0,
+                    'specialty': 'yolov8_paneer',
+                    'source': 'github'
+                })
+                
+                print(f"✅ YOLOv8 Paneer Detector loaded successfully")
+                
+            except Exception as e:
+                print(f"❌ Failed to load YOLOv8 model: {e}")
         
-        if not model_loaded:
-            print("⚠️  YOLOv8 model not found in any expected location")
-            print("   Please ensure best.pt is in the correct directory")
+        # Model 2: General Food Detector (FALLBACK)
+        food_detector_path = MODEL_PATHS['food_detector']
+        ingredients_path = MODEL_PATHS['ingredients_list']
         
-        # Model 2: Your existing general food model (FALLBACK)
-        if os.path.exists('food_detector.pth') and os.path.exists('pytorch_ingredients.pkl'):
-            with open('pytorch_ingredients.pkl', 'rb') as f:
-                ingredients_list_1 = pickle.load(f)
-            
-            model_1 = FoodAllergenDetector(len(ingredients_list_1))
-            model_1.load_state_dict(torch.load('food_detector.pth', map_location=device))
-            model_1.to(device)
-            model_1.eval()
-            
-            models_pipeline.append({
-                'name': 'general_food_model',
-                'model': model_1,
-                'ingredients': ingredients_list_1,
-                'weight': 0.3,  # Lower weight since YOLOv8 is primary
-                'specialty': 'general'
-            })
-            print("✅ General food model loaded as fallback")
+        if os.path.exists(food_detector_path) and os.path.exists(ingredients_path):
+            try:
+                print(f"🍽️ Loading general food model from: {food_detector_path}")
+                
+                # Load ingredients list
+                with open(ingredients_path, 'rb') as f:
+                    ingredients_list = pickle.load(f)
+                
+                # Load PyTorch model
+                model = FoodAllergenDetector(len(ingredients_list))
+                model.load_state_dict(torch.load(food_detector_path, map_location=device))
+                model.to(device)
+                model.eval()
+                
+                models_pipeline.append({
+                    'name': 'general_food_model',
+                    'model': model,
+                    'ingredients': ingredients_list,
+                    'weight': 0.3,
+                    'specialty': 'general',
+                    'source': 'github',
+                    'mlb': mlb_encoder  # Include MLB for this model
+                })
+                
+                print(f"✅ General food model loaded successfully ({len(ingredients_list)} ingredients)")
+                
+            except Exception as e:
+                print(f"❌ Failed to load general food model: {e}")
         
-        print(f"🚀 Multi-model pipeline loaded with {len(models_pipeline)} models")
+        if not models_pipeline:
+            print("💥 No models loaded successfully!")
+            return False
+        
+        print(f"🚀 Multi-model pipeline loaded with {len(models_pipeline)} models from GitHub")
+        
+        # Display final status
+        yolov8_available = any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline)
+        general_available = any(model['specialty'] == 'general' for model in models_pipeline)
+        
+        print(f"📊 Final Model Status:")
+        print(f"   - YOLOv8 Paneer Detector: {'✅ Ready' if yolov8_available else '❌ Not loaded'}")
+        print(f"   - General Food Model: {'✅ Ready' if general_available else '❌ Not loaded'}")
+        print(f"   - MLB Label Decoder: {'✅ Ready' if mlb_encoder else '❌ Not loaded'}")
+        
         return True
         
     except Exception as e:
-        print(f"❌ Error loading multi-model pipeline: {e}")
+        print(f"❌ Error in multi-model pipeline loading: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def multi_model_predict(image, confidence_threshold=0.3):
-    """Enhanced prediction using YOLOv8 + fallback models"""
+    """Enhanced prediction with MLB label decoding"""
     if not models_pipeline:
         raise Exception("Multi-model pipeline not loaded")
     
@@ -221,7 +357,7 @@ def multi_model_predict(image, confidence_threshold=0.3):
     for model_info in models_pipeline:
         try:
             if model_info['specialty'] == 'yolov8_paneer':
-                # YOLOv8 Object Detection
+                # YOLOv8 Object Detection (no MLB needed)
                 yolo_detector = model_info['model']
                 detections = yolo_detector.detect_ingredients(image)
                 weight = model_info['weight']
@@ -245,9 +381,10 @@ def multi_model_predict(image, confidence_threshold=0.3):
                         }
             
             elif model_info['specialty'] == 'general':
-                # Your existing general food model
+                # General Food Model with optional MLB decoding
                 model = model_info['model']
                 ingredients = model_info['ingredients']
+                mlb = model_info.get('mlb')  # Get MLB decoder
                 weight = model_info['weight']
                 
                 # Preprocess image for your existing model
@@ -268,14 +405,41 @@ def multi_model_predict(image, confidence_threshold=0.3):
                     outputs = model(image_tensor)
                     predictions = outputs.cpu().numpy()[0]
                 
-                detected_indices = np.where(predictions > confidence_threshold)[0]
+                # Use MLB to decode multi-label predictions if available
+                if mlb is not None:
+                    try:
+                        # Convert predictions to binary labels
+                        binary_predictions = (predictions > confidence_threshold).astype(int)
+                        
+                        # Only decode if there are any positive predictions
+                        if binary_predictions.sum() > 0:
+                            # Decode using MLB
+                            decoded_labels = mlb.inverse_transform([binary_predictions])
+                            
+                            for label in decoded_labels[0]:
+                                if label in ingredients:
+                                    idx = ingredients.index(label)
+                                    confidence = float(predictions[idx]) * weight
+                                    
+                                    combined_predictions[label] = {
+                                        'name': label,
+                                        'confidence': confidence,
+                                        'model_source': 'general_food_model_mlb',
+                                        'detection_type': 'multilabel_classification'
+                                    }
+                    except Exception as e:
+                        print(f"MLB decoding error: {e}")
+                        # Fallback to standard approach
+                        pass
                 
+                # Standard approach (with or without MLB failure)
+                detected_indices = np.where(predictions > confidence_threshold)[0]
                 for idx in detected_indices:
                     if idx < len(ingredients):
                         ingredient = ingredients[idx]
                         confidence = float(predictions[idx]) * weight
                         
-                        # Only add if not already detected by YOLOv8 or confidence is higher
+                        # Only add if not already detected by YOLOv8 or MLB, or confidence is higher
                         if ingredient not in combined_predictions or confidence > combined_predictions[ingredient]['confidence']:
                             combined_predictions[ingredient] = {
                                 'name': ingredient,
@@ -313,7 +477,26 @@ def save_scan_to_history(user_id, detected_ingredients, allergen_warnings, is_sa
     result = scan_history_collection.insert_one(scan_doc)
     return str(result.inserted_id)
 
+# Error handlers
+@app.errorhandler(Exception)
+def handle_exception(e):
+    app.logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+    return jsonify({'error': 'Internal server error occurred'}), 500
 
+@app.errorhandler(415)
+def unsupported_media_type(e):
+    return jsonify({
+        'error': 'Unsupported Media Type',
+        'message': 'Content-Type must be application/json',
+        'received_content_type': request.content_type
+    }), 415
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    app.logger.error(f"500 error: {str(e)}", exc_info=True)
+    return jsonify({'error': 'Internal server error'}), 500
+
+# Health check route
 @app.route('/')
 def health_check():
     """Health check endpoint for Render and keep-alive"""
@@ -323,8 +506,73 @@ def health_check():
         'models_loaded': len(models_pipeline),
         'mongodb_connected': True,
         'yolov8_available': any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline),
+        'mlb_available': mlb_encoder is not None,
         'timestamp': datetime.utcnow().isoformat()
     })
+
+# Debug endpoints
+@app.route('/api/debug/models-status')
+def debug_models_status():
+    """Check status of downloaded models"""
+    try:
+        model_status = {}
+        
+        for model_key, local_path in MODEL_PATHS.items():
+            if os.path.exists(local_path):
+                file_size = os.path.getsize(local_path)
+                model_status[model_key] = {
+                    'downloaded': True,
+                    'size_mb': round(file_size / 1024 / 1024, 2),
+                    'path': local_path
+                }
+            else:
+                model_status[model_key] = {
+                    'downloaded': False,
+                    'size_mb': 0,
+                    'path': local_path
+                }
+        
+        return jsonify({
+            'models': model_status,
+            'pipeline_loaded': len(models_pipeline),
+            'mlb_encoder_loaded': mlb_encoder is not None,
+            'total_models_available': len([m for m in model_status.values() if m['downloaded']]),
+            'model_urls': {k: v for k, v in MODEL_URLS.items()}
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/debug/db-info')
+def debug_db_info():
+    return jsonify({
+        'database_name': db.name,
+        'collections': db.list_collection_names(),
+        'users_collection_name': users_collection.name,
+        'server_info': client.server_info()['version']
+    })
+
+@app.route('/api/test-models', methods=['GET'])
+def test_models():
+    """Test model loading and basic functionality"""
+    try:
+        models_status = {
+            'models_loaded': len(models_pipeline),
+            'device': str(device),
+            'models': []
+        }
+        
+        for model_info in models_pipeline:
+            models_status['models'].append({
+                'name': model_info['name'],
+                'specialty': model_info['specialty'],
+                'ingredients_count': len(model_info.get('ingredients', []))
+            })
+        
+        return jsonify(models_status)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # Authentication Routes
 @app.route('/api/auth/register', methods=['POST'])
@@ -332,7 +580,6 @@ def register():
     try:
         data = request.get_json()
         print(f"📝 Registration attempt for: {data.get('email', 'unknown')}")
-        print(f"📝 Request data: {data}")
         
         required_fields = ['email', 'password', 'first_name', 'last_name']
         if not all(field in data for field in required_fields):
@@ -347,11 +594,10 @@ def register():
         email = data['email'].lower().strip()
         print(f"📧 Processing email: {email}")
         
-        # Check if user already exists with detailed logging
+        # Check if user already exists
         existing_user = users_collection.find_one({"email": email})
         if existing_user:
             print(f"❌ Email already exists: {email}")
-            print(f"❌ Existing user ID: {existing_user['_id']}")
             return jsonify({'error': 'Email already registered'}), 409
         
         # Create user document
@@ -367,26 +613,26 @@ def register():
         
         print(f"💾 Attempting to save user document: {user_doc['email']}")
         
-        # Insert user into MongoDB with detailed error handling
+        # Insert user into MongoDB
         try:
             result = users_collection.insert_one(user_doc)
             user_id = str(result.inserted_id)
             print(f"✅ User inserted with ID: {user_id}")
-        except pymongo.errors.DuplicateKeyError as e:
-            print(f"❌ Duplicate key error during insert: {e}")
-            return jsonify({'error': 'Email already registered (duplicate key)'}), 409
+            
+            # Verify user was actually saved
+            saved_user = users_collection.find_one({"_id": result.inserted_id})
+            if not saved_user:
+                print(f"❌ User verification failed for {email}")
+                return jsonify({'error': 'User creation verification failed'}), 500
+            
+            print(f"✅ User verification successful: {saved_user['email']}")
+            
+        except pymongo.errors.DuplicateKeyError:
+            print(f"❌ Duplicate key error for {email}")
+            return jsonify({'error': 'Email already registered'}), 409
         except Exception as e:
             print(f"❌ Database insert error: {e}")
             return jsonify({'error': f'Database error: {str(e)}'}), 500
-        
-        # Verify user was actually saved
-        saved_user = users_collection.find_one({"_id": result.inserted_id})
-        if not saved_user:
-            print(f"❌ User verification failed for {email}")
-            return jsonify({'error': 'User creation verification failed'}), 500
-        
-        print(f"✅ User verification successful: {saved_user['email']}")
-        print(f"✅ Saved user document: {saved_user}")
         
         # Create access token
         access_token = create_access_token(identity=user_id)
@@ -407,7 +653,6 @@ def register():
         
     except Exception as e:
         print(f"❌ Unexpected registration error: {str(e)}")
-        print(f"❌ Error type: {type(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': f'Registration failed: {str(e)}'}), 500
@@ -478,6 +723,7 @@ def get_profile():
         })
         
     except Exception as e:
+        print(f"❌ Profile fetch error: {str(e)}")
         return jsonify({'error': 'Failed to get profile'}), 500
 
 @app.route('/api/profile/allergies', methods=['POST'])
@@ -510,6 +756,7 @@ def update_allergies():
         return jsonify({'message': 'Allergies updated successfully'})
         
     except Exception as e:
+        print(f"❌ Allergies update error: {str(e)}")
         return jsonify({'error': 'Failed to update allergies'}), 500
 
 @app.route('/api/analyze-food', methods=['POST'])
@@ -517,31 +764,63 @@ def update_allergies():
 def analyze_food():
     user_id = get_jwt_identity()
     
-    if not models_pipeline:
-        return jsonify({'error': 'Multi-model pipeline not available. Please check server logs.'}), 500
-    
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image provided'}), 400
-    
-    image_file = request.files['image']
-    if image_file.filename == '':
-        return jsonify({'error': 'No image selected'}), 400
-    
     try:
-        # Load user's allergies from MongoDB
-        user_allergies = get_user_allergies(user_id)
+        app.logger.info(f"[DEBUG] Starting analyze_food for user: {user_id}")
         
-        # Save temporary image for YOLOv8 processing
+        if not models_pipeline:
+            app.logger.error("[ERROR] Multi-model pipeline not available")
+            return jsonify({'error': 'Multi-model pipeline not available. Please check server logs.'}), 500
+        
+        app.logger.info(f"[DEBUG] Models pipeline loaded: {len(models_pipeline)} models")
+        
+        if 'image' not in request.files:
+            app.logger.error("[ERROR] No image provided in request")
+            return jsonify({'error': 'No image provided'}), 400
+        
+        image_file = request.files['image']
+        if image_file.filename == '':
+            app.logger.error("[ERROR] No image selected")
+            return jsonify({'error': 'No image selected'}), 400
+        
+        app.logger.info(f"[DEBUG] Image received: {image_file.filename}")
+        
+        # Load user allergies
+        app.logger.info(f"[DEBUG] Loading allergies for user: {user_id}")
+        user_allergies = get_user_allergies(user_id)
+        app.logger.info(f"[DEBUG] Found {len(user_allergies)} allergies")
+        
+        # Save temporary image
         temp_filename = f"temp_{user_id}_{int(time.time())}.jpg"
-        image_file.save(temp_filename)
+        app.logger.info(f"[DEBUG] Saving temp file: {temp_filename}")
         
         try:
-            # Process with multi-model pipeline (YOLOv8 + fallback)
+            image_file.save(temp_filename)
+            app.logger.info(f"[DEBUG] Temp file saved successfully")
+            
+            if not os.path.exists(temp_filename):
+                app.logger.error(f"[ERROR] Temp file not created: {temp_filename}")
+                return jsonify({'error': 'Failed to save image'}), 500
+            
+            file_size = os.path.getsize(temp_filename)
+            app.logger.info(f"[DEBUG] Temp file size: {file_size} bytes")
+            
+            # Process with models
+            app.logger.info("[DEBUG] Starting model prediction")
             detected_ingredients = multi_model_predict(temp_filename)
+            app.logger.info(f"[DEBUG] Model prediction completed: {len(detected_ingredients)} ingredients detected")
+            
+        except Exception as e:
+            app.logger.error(f"[ERROR] Model prediction failed: {str(e)}", exc_info=True)
+            return jsonify({'error': f'Model prediction failed: {str(e)}'}), 500
+            
         finally:
-            # Clean up temporary file
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
+            # Clean up temp file
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+                    app.logger.info(f"[DEBUG] Temp file cleaned up: {temp_filename}")
+            except Exception as e:
+                app.logger.warning(f"[WARNING] Failed to clean up temp file: {e}")
         
         if not detected_ingredients:
             return jsonify({
@@ -554,6 +833,7 @@ def analyze_food():
             })
         
         # Enhanced allergen matching
+        app.logger.info("[DEBUG] Processing allergen warnings")
         allergen_warnings = []
         for ingredient in detected_ingredients:
             ingredient_name_lower = ingredient['name'].lower()
@@ -630,6 +910,7 @@ def analyze_food():
             confidence_score=float(avg_confidence)
         )
         
+        app.logger.info("[DEBUG] Analysis completed successfully")
         return jsonify({
             'scan_id': scan_id,
             'ingredients': detected_ingredients,
@@ -644,7 +925,7 @@ def analyze_food():
         })
         
     except Exception as e:
-        print(f"Multi-model analysis error: {e}")
+        app.logger.error(f"[ERROR] Analyze food failed: {str(e)}", exc_info=True)
         return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
 
 @app.route('/api/scan-history', methods=['GET'])
@@ -656,32 +937,37 @@ def get_scan_history():
     
     skip = (page - 1) * per_page
     
-    # Get scans with pagination
-    scans_cursor = scan_history_collection.find({"user_id": user_id}) \
-        .sort("created_at", -1) \
-        .skip(skip) \
-        .limit(per_page)
+    try:
+        # Get scans with pagination
+        scans_cursor = scan_history_collection.find({"user_id": user_id}) \
+            .sort("created_at", -1) \
+            .skip(skip) \
+            .limit(per_page)
+        
+        scans = list(scans_cursor)
+        total = scan_history_collection.count_documents({"user_id": user_id})
+        
+        scan_history = [{
+            'id': str(scan['_id']),
+            'ingredients': scan.get('detected_ingredients', []),
+            'warnings': scan.get('allergen_warnings', []),
+            'is_safe': scan.get('is_safe', True),
+            'confidence': scan.get('confidence_score', 0.0),
+            'created_at': scan['created_at'].isoformat()
+        } for scan in scans]
+        
+        return jsonify({
+            'scans': scan_history,
+            'total': total,
+            'pages': (total + per_page - 1) // per_page,
+            'current_page': page,
+            'has_next': skip + per_page < total,
+            'has_prev': page > 1
+        })
     
-    scans = list(scans_cursor)
-    total = scan_history_collection.count_documents({"user_id": user_id})
-    
-    scan_history = [{
-        'id': str(scan['_id']),
-        'ingredients': scan.get('detected_ingredients', []),
-        'warnings': scan.get('allergen_warnings', []),
-        'is_safe': scan.get('is_safe', True),
-        'confidence': scan.get('confidence_score', 0.0),
-        'created_at': scan['created_at'].isoformat()
-    } for scan in scans]
-    
-    return jsonify({
-        'scans': scan_history,
-        'total': total,
-        'pages': (total + per_page - 1) // per_page,
-        'current_page': page,
-        'has_next': skip + per_page < total,
-        'has_prev': page > 1
-    })
+    except Exception as e:
+        print(f"❌ Scan history error: {str(e)}")
+        return jsonify({'error': 'Failed to get scan history'}), 500
 
 @app.route('/api/pipeline-status', methods=['GET'])
 def pipeline_status():
@@ -696,110 +982,25 @@ def pipeline_status():
             } for model_info in models_pipeline
         ],
         'device': str(device),
-        'yolov8_available': any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline)
+        'yolov8_available': any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline),
+        'mlb_available': mlb_encoder is not None
     })
-
-# Add to your Flask app
-@app.route('/api/debug/db-info')
-def debug_db_info():
-    return jsonify({
-        'database_name': db.name,
-        'collections': db.list_collection_names(),
-        'users_collection_name': users_collection.name,
-        'server_info': client.server_info()['version']
-    })
-
-# Add debugging endpoint to check database status
-@app.route('/api/debug/users-count', methods=['GET'])
-def debug_users_count():
-    try:
-        count = users_collection.count_documents({})
-        recent_users = list(users_collection.find({}).sort("created_at", -1).limit(5))
-        
-        # Remove sensitive data
-        for user in recent_users:
-            user['_id'] = str(user['_id'])
-            user.pop('password_hash', None)
-        
-        return jsonify({
-            'total_users': count,
-            'recent_users': recent_users,
-            'collection_name': users_collection.name,
-            'database_name': db.name
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# Add comprehensive database verification endpoint
-@app.route('/api/debug/db-verify', methods=['GET'])
-def debug_db_verify():
-    try:
-        # Test MongoDB connection
-        client.admin.command('ping')
-        
-        # Get database info
-        db_stats = db.command('dbStats')
-        
-        # Get all collections and their stats
-        collections_info = {}
-        for collection_name in db.list_collection_names():
-            collection = db[collection_name]
-            count = collection.count_documents({})
-            collections_info[collection_name] = {
-                'count': count,
-                'sample_docs': list(collection.find({}).limit(2))
-            }
-            
-            # Convert ObjectId to string for JSON serialization
-            for doc in collections_info[collection_name]['sample_docs']:
-                if '_id' in doc:
-                    doc['_id'] = str(doc['_id'])
-                if 'password_hash' in doc:
-                    doc.pop('password_hash')  # Remove sensitive data
-        
-        # Test write operation
-        test_doc = {
-            'test_write': True,
-            'timestamp': datetime.utcnow(),
-            'test_id': str(uuid.uuid4())
-        }
-        
-        test_result = db['test_collection'].insert_one(test_doc)
-        db['test_collection'].delete_one({'_id': test_result.inserted_id})
-        
-        return jsonify({
-            'mongodb_status': 'connected',
-            'database_name': db.name,
-            'server_version': client.server_info()['version'],
-            'db_size_mb': round(db_stats['dataSize'] / (1024*1024), 2),
-            'collections': collections_info,
-            'write_test': 'successful',
-            'connection_string_set': bool(os.getenv('MONGODB_URI')),
-            'total_users': users_collection.count_documents({}),
-            'indexes_created': True
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'mongodb_status': 'error',
-            'error': str(e),
-            'connection_string_set': bool(os.getenv('MONGODB_URI'))
-        }), 500
 
 def initialize_app():
-    """Initialize MongoDB connections and load YOLOv8 multi-model pipeline"""
+    """Initialize app with model downloads from GitHub and MongoDB"""
     try:
         # Test MongoDB connection
         client.admin.command('ping')
         print("✅ MongoDB connection successful")
         
-        # Load models
+        # Download and load models from GitHub
+        print("🤖 Initializing ML models from GitHub...")
         pipeline_loaded = load_multi_model_pipeline()
         
         if pipeline_loaded:
-            print("🚀 YOLOv8-Enhanced FoodGuard API Server with MongoDB initialized successfully!")
+            print("🚀 YOLOv8-Enhanced FoodGuard API with GitHub models initialized successfully!")
         else:
-            print("⚠️  Server started but YOLOv8 model may not be loaded.")
+            print("⚠️  Server started but model loading failed. API will have limited functionality.")
             
     except Exception as e:
         print(f"❌ Initialization error: {e}")
@@ -807,14 +1008,17 @@ def initialize_app():
 if __name__ == '__main__':
     initialize_app()
     
-    print("🍽️ MongoDB-Enhanced FoodGuard API Server Starting...")
-    print("📝 Required files:")
+    print("🍽️ GitHub-Enhanced FoodGuard API Server Starting...")
+    print("📝 Model files will be downloaded from GitHub:")
     print("   - best.pt (YOLOv8 model)")
-    print("   - MongoDB connection string in MONGODB_URI environment variable")
+    print("   - food_detector.pth (General food model)")
+    print("   - pytorch_ingredients.pkl (Ingredients list)")
+    print("   - mlb.pkl (Label binarizer)")
     print()
     print("🎯 YOLOv8 Model Performance: mAP50 = 76.8%")
-    print("🔍 Detection capabilities: Paneer + Mint with bounding boxes")
+    print("🔍 Detection capabilities: Paneer + Mint with bounding boxes + Multi-label classification")
     print("🍃 Database: MongoDB with collections: users, allergies, scan_history")
+    print("🚀 Ready for production deployment on Render!")
     print()
     
     port = int(os.environ.get('PORT', 5000))
