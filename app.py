@@ -28,18 +28,45 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Simple CORS Configuration for Production
+# Enhanced CORS Configuration for Production
 CORS(app, 
      origins=[
          "https://foodguard-eight.vercel.app",
-         "https://foodguard-frontend.vercel.app",
+         "https://foodguard-frontend.vercel.app", 
          "http://localhost:3000",
          "http://127.0.0.1:3000"
      ],
-     allow_headers=["Content-Type", "Authorization", "Accept"],
-     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     supports_credentials=False  # Disable credentials for simplicity
+     allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
+     supports_credentials=False,
+     max_age=86400  # Cache preflight for 24 hours
 )
+
+# Add explicit OPTIONS handler for all routes
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", request.headers.get('Origin', '*'))
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type,Authorization,Accept,Origin,X-Requested-With")
+        response.headers.add('Access-Control-Allow-Methods', "GET,PUT,POST,DELETE,OPTIONS,HEAD")
+        response.headers.add('Access-Control-Max-Age', '86400')
+        return response
+
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    origin = request.headers.get('Origin')
+    if origin in [
+        "https://foodguard-eight.vercel.app",
+        "https://foodguard-frontend.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ]:
+        response.headers.add('Access-Control-Allow-Origin', origin)
+    response.headers.add('Access-Control-Allow-Headers', "Content-Type,Authorization,Accept,Origin,X-Requested-With")
+    response.headers.add('Access-Control-Allow-Methods', "GET,PUT,POST,DELETE,OPTIONS,HEAD")
+    return response
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -508,19 +535,29 @@ def internal_server_error(e):
     app.logger.error(f"500 error: {str(e)}", exc_info=True)
     return jsonify({'error': 'Internal server error'}), 500
 
-# Health check route
+# Health check route - Update to include CORS headers
 @app.route('/')
+@app.route('/api')
 def health_check():
     """Health check endpoint for Render and keep-alive"""
-    return jsonify({
+    response_data = {
         'status': 'healthy',
         'message': 'FoodGuard API backend is running',
         'models_loaded': len(models_pipeline),
         'mongodb_connected': True,
         'yolov8_available': any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline),
         'mlb_available': mlb_encoder is not None,
-        'timestamp': datetime.utcnow().isoformat()
-    })
+        'timestamp': datetime.utcnow().isoformat(),
+        'cors_enabled': True,
+        'allowed_origins': [
+            "https://foodguard-eight.vercel.app",
+            "https://foodguard-frontend.vercel.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000"
+        ]
+    }
+    response = jsonify(response_data)
+    return response
 
 # Debug endpoints
 @app.route('/api/debug/models-status')
@@ -990,12 +1027,26 @@ def pipeline_status():
                 'name': model_info['name'],
                 'weight': model_info['weight'],
                 'specialty': model_info['specialty'],
-                'ingredients_count': len(model_info['ingredients']) if 'ingredients' in model_info else 0
+                'source': model_info.get('source', 'unknown'),
+                'ingredients_count': len(model_info.get('ingredients', [])),
+                'mlb_included': 'mlb' in model_info
             } for model_info in models_pipeline
         ],
         'device': str(device),
-        'yolov8_available': any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline),
+        'yolov8_available': any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline),
         'mlb_available': mlb_encoder is not None
+    })
+
+# Add CORS test endpoint
+@app.route('/api/cors-test', methods=['GET', 'POST', 'OPTIONS'])
+def cors_test():
+    """Test CORS functionality"""
+    return jsonify({
+        'message': 'CORS test successful',
+        'method': request.method,
+        'origin': request.headers.get('Origin', 'No origin header'),
+        'headers': dict(request.headers),
+        'timestamp': datetime.utcnow().isoformat()
     })
 
 def initialize_app():
