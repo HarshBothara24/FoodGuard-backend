@@ -28,43 +28,18 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Enhanced CORS Configuration for Production
-CORS_ORIGINS = [
-    "https://foodguard-eight.vercel.app",  # Your Vercel deployment
-    "https://foodguard-frontend.vercel.app",  # Alternative Vercel URLs
-    "http://localhost:3000",  # Local development
-    "http://127.0.0.1:3000",  # Alternative local
-    "https://localhost:3000"  # HTTPS local
-]
-
-# Temporary CORS fix for testing (use specific origins in production)
+# Simple CORS Configuration for Production
 CORS(app, 
-     origins=["*"],  # Allow all origins temporarily
+     origins=[
+         "https://foodguard-eight.vercel.app",
+         "https://foodguard-frontend.vercel.app",
+         "http://localhost:3000",
+         "http://127.0.0.1:3000"
+     ],
      allow_headers=["Content-Type", "Authorization", "Accept"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     supports_credentials=False  # Set to False when using origins=["*"]
+     supports_credentials=False  # Disable credentials for simplicity
 )
-
-# Add explicit OPTIONS handler for preflight requests
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', "*")
-        response.headers.add('Access-Control-Allow-Methods', "*")
-        return response
-
-# Add response headers for all requests
-@app.after_request
-def after_request(response):
-    origin = request.headers.get('Origin')
-    if origin in CORS_ORIGINS:
-        response.headers.add('Access-Control-Allow-Origin', origin)
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    return response
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -1036,27 +1011,112 @@ def initialize_app():
         
         if pipeline_loaded:
             print("🚀 YOLOv8-Enhanced FoodGuard API with GitHub models initialized successfully!")
+            return True
         else:
             print("⚠️  Server started but model loading failed. API will have limited functionality.")
+            return False
             
     except Exception as e:
         print(f"❌ Initialization error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# Add endpoint to trigger model reloading manually
+@app.route('/api/reload-models', methods=['POST'])
+def reload_models():
+    """Manually reload models - useful for debugging"""
+    try:
+        print("🔄 Manual model reload requested...")
+        success = load_multi_model_pipeline()
+        
+        return jsonify({
+            'success': success,
+            'models_loaded': len(models_pipeline),
+            'yolov8_available': any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline),
+            'mlb_available': mlb_encoder is not None,
+            'message': 'Model reload completed' if success else 'Model reload failed'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Model reload failed with exception'
+        }), 500
+
+# Add a better health check with model status
+@app.route('/api/health-detailed', methods=['GET'])
+def health_detailed():
+    """Detailed health check with model and database status"""
+    try:
+        # Check MongoDB
+        mongodb_status = True
+        try:
+            client.admin.command('ping')
+        except:
+            mongodb_status = False
+        
+        # Check models
+        models_status = {
+            'total_loaded': len(models_pipeline),
+            'yolov8_available': any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline),
+            'general_model_available': any(model.get('specialty') == 'general' for model in models_pipeline),
+            'mlb_available': mlb_encoder is not None
+        }
+        
+        # Check file system
+        model_files_status = {}
+        for model_key, path in MODEL_PATHS.items():
+            model_files_status[model_key] = {
+                'exists': os.path.exists(path),
+                'size_mb': round(os.path.getsize(path) / 1024 / 1024, 2) if os.path.exists(path) else 0
+            }
+        
+        overall_status = 'healthy' if (mongodb_status and len(models_pipeline) > 0) else 'degraded'
+        
+        return jsonify({
+            'status': overall_status,
+            'timestamp': datetime.utcnow().isoformat(),
+            'mongodb': {
+                'connected': mongodb_status,
+                'database': db.name,
+                'collections': len(db.list_collection_names()) if mongodb_status else 0
+            },
+            'models': models_status,
+            'model_files': model_files_status,
+            'system': {
+                'device': str(device),
+                'python_version': sys.version,
+                'pytorch_version': torch.__version__
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
 
 if __name__ == '__main__':
-    initialize_app()
+    print("🍽️ FoodGuard API Server Starting...")
+    print("📝 Model files will be downloaded from GitHub on first request")
+    print()
     
-    print("🍽️ GitHub-Enhanced FoodGuard API Server Starting...")
-    print("📝 Model files will be downloaded from GitHub:")
-    print("   - best.pt (YOLOv8 model)")
-    print("   - food_detector.pth (General food model)")
-    print("   - pytorch_ingredients.pkl (Ingredients list)")
-    print("   - mlb.pkl (Label binarizer)")
-    print()
-    print("🎯 YOLOv8 Model Performance: mAP50 = 76.8%")
-    print("🔍 Detection capabilities: Paneer + Mint with bounding boxes + Multi-label classification")
-    print("🍃 Database: MongoDB with collections: users, allergies, scan_history")
-    print("🚀 Ready for production deployment on Render!")
-    print()
+    # Initialize the app
+    init_success = initialize_app()
+    
+    if init_success:
+        print("✅ Server initialization completed successfully")
+    else:
+        print("⚠️  Server started with warnings - some features may be limited")
+        print("💡 Visit /api/reload-models (POST) to retry model loading")
+        print("💡 Visit /api/health-detailed to see detailed status")
+    
+    print(f"🚀 Server ready at http://0.0.0.0:{int(os.environ.get('PORT', 5000))}")
+    print("🔗 Health check: /")
+    print("📊 Detailed health: /api/health-detailed")
+    print("🔄 Reload models: /api/reload-models (POST)")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
