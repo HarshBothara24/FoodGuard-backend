@@ -14,11 +14,14 @@ import uuid
 import os
 import time
 import sys
+from dotenv import load_dotenv
 
 # MongoDB imports with URL parsing
 import pymongo
 from bson import ObjectId
 from urllib.parse import urlparse, urlunparse, quote_plus
+
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -33,7 +36,7 @@ jwt = JWTManager(app)
 def create_mongodb_client():
     """Create MongoDB client with properly encoded credentials"""
     try:
-        raw_uri = os.environ.get('MONGODB_URI')
+        raw_uri = os.getenv('MONGODB_URI')
         if not raw_uri:
             raise Exception("MONGODB_URI environment variable not set")
         
@@ -326,20 +329,32 @@ def health_check():
 # Authentication Routes
 @app.route('/api/auth/register', methods=['POST'])
 def register():
-    data = request.get_json()
-    
-    required_fields = ['email', 'password', 'first_name', 'last_name']
-    if not all(field in data for field in required_fields):
-        return jsonify({'error': 'Missing required fields'}), 400
-    
-    if len(data['password']) < 6:
-        return jsonify({'error': 'Password must be at least 6 characters'}), 400
-    
-    email = data['email'].lower()
-    if users_collection.find_one({"email": email}):
-        return jsonify({'error': 'Email already registered'}), 409
-    
     try:
+        data = request.get_json()
+        print(f"📝 Registration attempt for: {data.get('email', 'unknown')}")
+        print(f"📝 Request data: {data}")
+        
+        required_fields = ['email', 'password', 'first_name', 'last_name']
+        if not all(field in data for field in required_fields):
+            missing_fields = [f for f in required_fields if f not in data]
+            print(f"❌ Missing required fields: {missing_fields}")
+            return jsonify({'error': f'Missing required fields: {missing_fields}'}), 400
+        
+        if len(data['password']) < 6:
+            print(f"❌ Password too short for {data['email']}")
+            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+        
+        email = data['email'].lower().strip()
+        print(f"📧 Processing email: {email}")
+        
+        # Check if user already exists with detailed logging
+        existing_user = users_collection.find_one({"email": email})
+        if existing_user:
+            print(f"❌ Email already exists: {email}")
+            print(f"❌ Existing user ID: {existing_user['_id']}")
+            return jsonify({'error': 'Email already registered'}), 409
+        
+        # Create user document
         user_doc = {
             "email": email,
             "password_hash": generate_password_hash(data['password']),
@@ -350,12 +365,33 @@ def register():
             "is_active": True
         }
         
-        result = users_collection.insert_one(user_doc)
-        user_id = str(result.inserted_id)
+        print(f"💾 Attempting to save user document: {user_doc['email']}")
         
+        # Insert user into MongoDB with detailed error handling
+        try:
+            result = users_collection.insert_one(user_doc)
+            user_id = str(result.inserted_id)
+            print(f"✅ User inserted with ID: {user_id}")
+        except pymongo.errors.DuplicateKeyError as e:
+            print(f"❌ Duplicate key error during insert: {e}")
+            return jsonify({'error': 'Email already registered (duplicate key)'}), 409
+        except Exception as e:
+            print(f"❌ Database insert error: {e}")
+            return jsonify({'error': f'Database error: {str(e)}'}), 500
+        
+        # Verify user was actually saved
+        saved_user = users_collection.find_one({"_id": result.inserted_id})
+        if not saved_user:
+            print(f"❌ User verification failed for {email}")
+            return jsonify({'error': 'User creation verification failed'}), 500
+        
+        print(f"✅ User verification successful: {saved_user['email']}")
+        print(f"✅ Saved user document: {saved_user}")
+        
+        # Create access token
         access_token = create_access_token(identity=user_id)
         
-        return jsonify({
+        response_data = {
             'message': 'Account created successfully',
             'access_token': access_token,
             'user': {
@@ -364,34 +400,49 @@ def register():
                 'first_name': data['first_name'],
                 'last_name': data['last_name']
             }
-        }), 201
+        }
+        
+        print(f"🎉 Registration completed successfully for: {email}")
+        return jsonify(response_data), 201
         
     except Exception as e:
-        return jsonify({'error': 'Registration failed'}), 500
+        print(f"❌ Unexpected registration error: {str(e)}")
+        print(f"❌ Error type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Registration failed: {str(e)}'}), 500
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
-    data = request.get_json()
-    
-    if not all(k in data for k in ['email', 'password']):
-        return jsonify({'error': 'Missing email or password'}), 400
-    
-    email = data['email'].lower()
-    user = users_collection.find_one({"email": email, "is_active": True})
-    
-    if user and check_password_hash(user['password_hash'], data['password']):
-        access_token = create_access_token(identity=str(user['_id']))
-        return jsonify({
-            'access_token': access_token,
-            'user': {
-                'id': str(user['_id']),
-                'email': user['email'],
-                'first_name': user['first_name'],
-                'last_name': user['last_name']
-            }
-        })
-    
-    return jsonify({'error': 'Invalid email or password'}), 401
+    try:
+        data = request.get_json()
+        print(f"🔐 Login attempt for: {data.get('email', 'unknown')}")
+        
+        if not all(k in data for k in ['email', 'password']):
+            return jsonify({'error': 'Missing email or password'}), 400
+        
+        email = data['email'].lower().strip()
+        user = users_collection.find_one({"email": email, "is_active": True})
+        
+        if user and check_password_hash(user['password_hash'], data['password']):
+            access_token = create_access_token(identity=str(user['_id']))
+            print(f"✅ Login successful for: {email}")
+            return jsonify({
+                'access_token': access_token,
+                'user': {
+                    'id': str(user['_id']),
+                    'email': user['email'],
+                    'first_name': user['first_name'],
+                    'last_name': user['last_name']
+                }
+            })
+        
+        print(f"❌ Invalid credentials for: {email}")
+        return jsonify({'error': 'Invalid email or password'}), 401
+        
+    except Exception as e:
+        print(f"❌ Login error: {str(e)}")
+        return jsonify({'error': 'Login failed'}), 500
 
 @app.route('/api/profile', methods=['GET'])
 @jwt_required()
@@ -648,14 +699,92 @@ def pipeline_status():
         'yolov8_available': any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline)
     })
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
+# Add to your Flask app
+@app.route('/api/debug/db-info')
+def debug_db_info():
     return jsonify({
-        'status': 'healthy',
-        'mongodb_connected': client.admin.command('ping')['ok'] == 1,
-        'models_loaded': len(models_pipeline),
-        'timestamp': datetime.utcnow().isoformat()
+        'database_name': db.name,
+        'collections': db.list_collection_names(),
+        'users_collection_name': users_collection.name,
+        'server_info': client.server_info()['version']
     })
+
+# Add debugging endpoint to check database status
+@app.route('/api/debug/users-count', methods=['GET'])
+def debug_users_count():
+    try:
+        count = users_collection.count_documents({})
+        recent_users = list(users_collection.find({}).sort("created_at", -1).limit(5))
+        
+        # Remove sensitive data
+        for user in recent_users:
+            user['_id'] = str(user['_id'])
+            user.pop('password_hash', None)
+        
+        return jsonify({
+            'total_users': count,
+            'recent_users': recent_users,
+            'collection_name': users_collection.name,
+            'database_name': db.name
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Add comprehensive database verification endpoint
+@app.route('/api/debug/db-verify', methods=['GET'])
+def debug_db_verify():
+    try:
+        # Test MongoDB connection
+        client.admin.command('ping')
+        
+        # Get database info
+        db_stats = db.command('dbStats')
+        
+        # Get all collections and their stats
+        collections_info = {}
+        for collection_name in db.list_collection_names():
+            collection = db[collection_name]
+            count = collection.count_documents({})
+            collections_info[collection_name] = {
+                'count': count,
+                'sample_docs': list(collection.find({}).limit(2))
+            }
+            
+            # Convert ObjectId to string for JSON serialization
+            for doc in collections_info[collection_name]['sample_docs']:
+                if '_id' in doc:
+                    doc['_id'] = str(doc['_id'])
+                if 'password_hash' in doc:
+                    doc.pop('password_hash')  # Remove sensitive data
+        
+        # Test write operation
+        test_doc = {
+            'test_write': True,
+            'timestamp': datetime.utcnow(),
+            'test_id': str(uuid.uuid4())
+        }
+        
+        test_result = db['test_collection'].insert_one(test_doc)
+        db['test_collection'].delete_one({'_id': test_result.inserted_id})
+        
+        return jsonify({
+            'mongodb_status': 'connected',
+            'database_name': db.name,
+            'server_version': client.server_info()['version'],
+            'db_size_mb': round(db_stats['dataSize'] / (1024*1024), 2),
+            'collections': collections_info,
+            'write_test': 'successful',
+            'connection_string_set': bool(os.getenv('MONGODB_URI')),
+            'total_users': users_collection.count_documents({}),
+            'indexes_created': True
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'mongodb_status': 'error',
+            'error': str(e),
+            'connection_string_set': bool(os.getenv('MONGODB_URI'))
+        }), 500
 
 def initialize_app():
     """Initialize MongoDB connections and load YOLOv8 multi-model pipeline"""
