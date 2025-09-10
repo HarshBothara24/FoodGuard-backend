@@ -15,6 +15,11 @@ import os
 import time
 import sys
 from dotenv import load_dotenv
+import google.generativeai as genai
+import base64
+from io import BytesIO
+import json
+import re
 
 # MongoDB imports with URL parsing
 import pymongo
@@ -82,6 +87,174 @@ except Exception as e:
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 models_pipeline = []
 
+# Gemini AI Ingredient Detector Class
+class GeminiIngredientDetector:
+    def __init__(self, api_key):
+        """Initialize Gemini for ingredient detection"""
+        try:
+            genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            # Test the connection
+            test_response = self.model.generate_content("Hello")
+            print("✅ Gemini AI Ingredient Detector loaded successfully")
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize Gemini: {e}")
+            raise
+        
+    def detect_ingredients(self, image):
+        """Use Gemini to identify ingredients in food image"""
+        try:
+            # Convert image to appropriate format
+            if isinstance(image, str):  # File path
+                with open(image, 'rb') as f:
+                    image_data = f.read()
+            else:  # PIL Image
+                buffer = BytesIO()
+                image.save(buffer, format='JPEG')
+                image_data = buffer.getvalue()
+            
+            # Create image part for Gemini
+            image_parts = [
+                {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(image_data).decode('utf-8')
+                }
+            ]
+            
+            # Specialized prompt for comprehensive ingredient detection
+            prompt = """
+            Analyze this food image and identify ALL visible ingredients, components, and food items with high accuracy.
+            
+            IMPORTANT: Only identify ingredients you can clearly see. Do not guess or assume.
+            
+            Focus on detecting:
+            1. Primary ingredients (proteins like paneer, chicken, mutton, fish, eggs)
+            2. Dairy products (milk, cheese, butter, ghee, yogurt, cream)
+            3. Vegetables and fruits (onions, tomatoes, garlic, ginger, leafy greens, etc.)
+            4. Grains and cereals (rice, wheat, bread, naan, roti)
+            5. Legumes and pulses (dal, chickpeas, lentils, beans)
+            6. Nuts and seeds (almonds, cashews, sesame, etc.)
+            7. Spices and herbs (turmeric, cumin, coriander, mint, cilantro, etc.)
+            8. Oils and fats
+            
+            Be very specific and conservative:
+            - Only report what you can actually see in the image
+            - Don't identify paneer unless you're absolutely certain it's visible
+            - Be specific: if you see ghee, say "ghee" not "butter"
+            - If you see specific vegetables, name them individually
+            - Use confidence scores between 0.5-0.95 (be realistic)
+            
+            Return your response as a JSON array in this exact format:
+            [
+                {"name": "ingredient_name", "confidence": 0.85, "category": "protein"},
+                {"name": "another_ingredient", "confidence": 0.75, "category": "dairy"}
+            ]
+            
+            Categories: protein, dairy, vegetable, grain, spice, nut, oil, fruit, legume, processed, herb, other
+            
+            Only return the JSON array, no other text.
+            """
+            
+            # Generate content with image
+            response = self.model.generate_content([prompt] + image_parts)
+            
+            # Parse JSON response
+            try:
+                # Clean up response text
+                response_text = response.text.strip()
+                
+                # Extract JSON from response
+                json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group()
+                    ingredients_data = json.loads(json_str)
+                else:
+                    # Try parsing the entire response as JSON
+                    ingredients_data = json.loads(response_text)
+                
+                detected_ingredients = []
+                for item in ingredients_data:
+                    if isinstance(item, dict) and 'name' in item:
+                        confidence = float(item.get('confidence', 0.7))
+                        
+                        # Cap confidence at reasonable levels
+                        confidence = min(confidence, 0.95)
+                        
+                        # Skip very low confidence detections
+                        if confidence < 0.5:
+                            continue
+                            
+                        detected_ingredients.append({
+                            'name': item['name'].lower().strip(),
+                            'confidence': confidence,
+                            'category': item.get('category', 'unknown'),
+                            'model_source': 'gemini_vision',
+                            'detection_type': 'ai_vision_analysis'
+                        })
+                
+                return detected_ingredients
+                
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                print(f"JSON parsing failed: {e}")
+                # Fallback: extract ingredients from text response
+                return self._extract_ingredients_from_text(response.text)
+            
+        except Exception as e:
+            print(f"Error in Gemini detection: {e}")
+            return []
+    
+    def _extract_ingredients_from_text(self, text):
+        """Fallback method to extract ingredients from text response"""
+        ingredients = []
+        
+        # Common Indian and general ingredients
+        common_ingredients = [
+            'paneer', 'cottage cheese', 'tomato', 'onion', 'garlic', 'ginger', 
+            'turmeric', 'cumin', 'coriander', 'mint', 'cilantro', 'spinach',
+            'potato', 'cauliflower', 'peas', 'carrot', 'bell pepper', 'chili',
+            'rice', 'wheat', 'bread', 'naan', 'roti', 'dal', 'lentils',
+            'chickpeas', 'chicken', 'mutton', 'fish', 'eggs', 'milk', 'ghee',
+            'oil', 'butter', 'yogurt', 'cream', 'cheese', 'almonds', 'cashews'
+        ]
+        
+        text_lower = text.lower()
+        
+        for ingredient in common_ingredients:
+            if ingredient in text_lower:
+                # Avoid duplicates
+                if not any(existing['name'] == ingredient for existing in ingredients):
+                    ingredients.append({
+                        'name': ingredient,
+                        'confidence': 0.6,  # Conservative confidence for text extraction
+                        'category': self._categorize_ingredient(ingredient),
+                        'model_source': 'gemini_text_extraction',
+                        'detection_type': 'text_analysis'
+                    })
+        
+        return ingredients
+    
+    def _categorize_ingredient(self, ingredient):
+        """Categorize ingredients for better organization"""
+        categories = {
+            'protein': ['paneer', 'cottage cheese', 'chicken', 'mutton', 'fish', 'eggs'],
+            'dairy': ['milk', 'ghee', 'butter', 'yogurt', 'cream', 'cheese'],
+            'vegetable': ['tomato', 'onion', 'garlic', 'ginger', 'spinach', 'potato', 'cauliflower', 'peas', 'carrot', 'bell pepper'],
+            'spice': ['turmeric', 'cumin', 'coriander', 'chili'],
+            'herb': ['mint', 'cilantro'],
+            'grain': ['rice', 'wheat', 'bread', 'naan', 'roti'],
+            'legume': ['dal', 'lentils', 'chickpeas'],
+            'nut': ['almonds', 'cashews'],
+            'oil': ['oil']
+        }
+        
+        for category, items in categories.items():
+            if ingredient.lower() in items:
+                return category
+        
+        return 'other'
+
 # YOLOv8 Paneer Detector Class
 class YOLOv8PaneerDetector:
     def __init__(self, model_path, confidence_threshold=0.5):
@@ -113,6 +286,9 @@ class YOLOv8PaneerDetector:
                         conf = float(box.conf)
                         cls = int(box.cls)
                         
+                        # Cap confidence at 100% and ensure it meets threshold
+                        conf = min(conf, 1.0)
+                        
                         if conf >= self.confidence_threshold and cls < len(self.class_names):
                             class_name = self.class_names[cls].lower()
                             bbox = box.xyxy.cpu().numpy().flatten().tolist()
@@ -122,7 +298,8 @@ class YOLOv8PaneerDetector:
                                 'confidence': conf,
                                 'bbox': bbox,
                                 'model_source': 'yolov8_paneer_detector',
-                                'class_id': cls
+                                'class_id': cls,
+                                'detection_type': 'object_detection'
                             })
             
             return detected_ingredients
@@ -131,7 +308,7 @@ class YOLOv8PaneerDetector:
             print(f"Error in YOLOv8 detection: {e}")
             return []
 
-# Your existing model classes (for fallback)
+# Your existing model classes
 class FoodAllergenDetector(nn.Module):
     def __init__(self, num_classes):
         super(FoodAllergenDetector, self).__init__()
@@ -142,7 +319,7 @@ class FoodAllergenDetector(nn.Module):
         return torch.sigmoid(self.backbone(x))
 
 def load_multi_model_pipeline():
-    """Load multiple models with YOLOv8 as primary paneer detector"""
+    """Load three-model pipeline: YOLOv8 + Gemini + General Model"""
     global models_pipeline
     
     try:
@@ -159,50 +336,74 @@ def load_multi_model_pipeline():
             os.path.join("food_detectors", "paneer_mint_yolov8", "weights", "best.pt")
         ]
         
-        model_loaded = False
+        yolo_loaded = False
         for path in possible_paths:
             if os.path.exists(path):
                 try:
-                    yolov8_detector = YOLOv8PaneerDetector(path, confidence_threshold=0.5)
+                    # Use higher confidence threshold to reduce false positives
+                    yolov8_detector = YOLOv8PaneerDetector(path, confidence_threshold=0.7)
                     
                     models_pipeline.append({
                         'name': 'yolov8_paneer_detector',
                         'model': yolov8_detector,
                         'ingredients': ['paneer', 'mint'],
-                        'weight': 1.0,  # Primary model gets full weight
+                        'weight': 0.9,  # Slightly reduced weight
                         'specialty': 'yolov8_paneer'
                     })
                     
                     print(f"✅ YOLOv8 Paneer Detector loaded from: {path}")
-                    model_loaded = True
+                    yolo_loaded = True
                     break
                     
                 except Exception as e:
                     print(f"❌ Failed to load YOLOv8 from {path}: {e}")
                     continue
         
-        if not model_loaded:
+        if not yolo_loaded:
             print("⚠️  YOLOv8 model not found in any expected location")
-            print("   Please ensure best.pt is in the correct directory")
         
-        # Model 2: Your existing general food model (FALLBACK)
+        # Model 2: Gemini Vision AI (SECONDARY)
+        gemini_api_key = os.getenv('GEMINI_API_KEY')
+        if gemini_api_key:
+            try:
+                gemini_detector = GeminiIngredientDetector(gemini_api_key)
+                
+                models_pipeline.append({
+                    'name': 'gemini_vision',
+                    'model': gemini_detector,
+                    'ingredients': [],  # Dynamic - Gemini can identify any ingredient
+                    'weight': 0.8,  # Moderate weight for Gemini
+                    'specialty': 'ai_vision'
+                })
+                
+                print("✅ Gemini Vision AI loaded successfully")
+                
+            except Exception as e:
+                print(f"❌ Failed to load Gemini: {e}")
+        else:
+            print("⚠️  GEMINI_API_KEY not found in environment variables")
+        
+        # Model 3: Your existing general food model (FALLBACK)
         if os.path.exists('food_detector.pth') and os.path.exists('pytorch_ingredients.pkl'):
-            with open('pytorch_ingredients.pkl', 'rb') as f:
-                ingredients_list_1 = pickle.load(f)
-            
-            model_1 = FoodAllergenDetector(len(ingredients_list_1))
-            model_1.load_state_dict(torch.load('food_detector.pth', map_location=device))
-            model_1.to(device)
-            model_1.eval()
-            
-            models_pipeline.append({
-                'name': 'general_food_model',
-                'model': model_1,
-                'ingredients': ingredients_list_1,
-                'weight': 0.3,  # Lower weight since YOLOv8 is primary
-                'specialty': 'general'
-            })
-            print("✅ General food model loaded as fallback")
+            try:
+                with open('pytorch_ingredients.pkl', 'rb') as f:
+                    ingredients_list_1 = pickle.load(f)
+                
+                model_1 = FoodAllergenDetector(len(ingredients_list_1))
+                model_1.load_state_dict(torch.load('food_detector.pth', map_location=device))
+                model_1.to(device)
+                model_1.eval()
+                
+                models_pipeline.append({
+                    'name': 'general_food_model',
+                    'model': model_1,
+                    'ingredients': ingredients_list_1,
+                    'weight': 0.7,  # Lower weight since others are primary
+                    'specialty': 'general'
+                })
+                print("✅ General food model loaded as fallback")
+            except Exception as e:
+                print(f"❌ Failed to load general food model: {e}")
         
         print(f"🚀 Multi-model pipeline loaded with {len(models_pipeline)} models")
         return True
@@ -211,46 +412,226 @@ def load_multi_model_pipeline():
         print(f"❌ Error loading multi-model pipeline: {e}")
         return False
 
-def multi_model_predict(image, confidence_threshold=0.3):
-    """Enhanced prediction using YOLOv8 + fallback models"""
+def validate_allergen_match(allergen, ingredient):
+    """Prevent obviously incorrect matches"""
+    
+    # Define invalid combinations
+    invalid_combinations = [
+        # Dairy cross-contamination prevention
+        ('cheese', 'ghee'),
+        ('cheese', 'butter'),  
+        ('butter', 'paneer'),
+        ('butter', 'ghee'),
+        ('ghee', 'cheese'),
+        ('ghee', 'butter'),
+        
+        # Prevent nut confusion
+        ('nuts', 'coconut'),
+        ('tree nuts', 'coconut'),
+        
+        # Prevent grain confusion
+        ('wheat', 'rice'),
+        ('gluten', 'rice'),
+        
+        # Prevent spice confusion
+        ('nut', 'nutmeg'),  # nutmeg is a spice, not a nut
+    ]
+    
+    allergen_lower = allergen.lower()
+    ingredient_lower = ingredient.lower()
+    
+    for invalid_allergen, invalid_ingredient in invalid_combinations:
+        if (invalid_allergen == allergen_lower and invalid_ingredient in ingredient_lower) or \
+           (invalid_ingredient == allergen_lower and invalid_allergen in ingredient_lower):
+            print(f"🚫 Blocked invalid match: {allergen} -> {ingredient}")
+            return False
+    
+    return True
+
+def enhanced_allergen_matching(detected_ingredients, user_allergies):
+    """Fixed allergen matching with proper specificity"""
+    allergen_warnings = []
+    
+    for ingredient in detected_ingredients:
+        ingredient_name_lower = ingredient['name'].lower().strip()
+        
+        for user_allergy in user_allergies:
+            allergen_lower = user_allergy['allergen_name'].lower().strip()
+            
+            match_found = False
+            match_type = 'no_match'
+            match_confidence = 0.0
+            
+            # 1. EXACT MATCHING (highest priority)
+            if ingredient_name_lower == allergen_lower:
+                match_found = True
+                match_type = 'exact_match'
+                match_confidence = 1.0
+            
+            # 2. SPECIFIC INGREDIENT MATCHING
+            elif allergen_lower == 'paneer':
+                paneer_variants = ['paneer', 'cottage cheese', 'indian cottage cheese', 'fresh cheese']
+                if any(variant in ingredient_name_lower for variant in paneer_variants):
+                    match_found = True
+                    match_type = 'paneer_variant'
+                    match_confidence = 0.95
+            
+            elif allergen_lower == 'cheese':
+                # Only match actual cheese types, NOT ghee, butter, or paneer
+                cheese_types = ['cheese', 'cheddar', 'mozzarella', 'parmesan', 'gouda', 'swiss']
+                if any(cheese_type in ingredient_name_lower for cheese_type in cheese_types):
+                    # Exclude dairy products that aren't cheese
+                    if not any(exclude in ingredient_name_lower for exclude in ['ghee', 'butter', 'paneer']):
+                        match_found = True
+                        match_type = 'cheese_variant'
+                        match_confidence = 0.9
+            
+            elif allergen_lower == 'butter':
+                if 'butter' in ingredient_name_lower and 'ghee' not in ingredient_name_lower:
+                    match_found = True
+                    match_type = 'butter_match'
+                    match_confidence = 0.9
+            
+            elif allergen_lower == 'ghee':
+                if 'ghee' in ingredient_name_lower:
+                    match_found = True
+                    match_type = 'ghee_match'
+                    match_confidence = 0.95
+            
+            # 3. BROAD CATEGORY MATCHING
+            elif allergen_lower in ['dairy', 'milk allergy', 'lactose intolerance', 'lactose']:
+                dairy_products = ['milk', 'cheese', 'butter', 'ghee', 'cream', 'yogurt', 'paneer', 'curd', 'whey']
+                if any(dairy_prod in ingredient_name_lower for dairy_prod in dairy_products):
+                    match_found = True
+                    match_type = 'broad_dairy_match'
+                    match_confidence = 0.8
+            
+            elif 'nut' in allergen_lower or allergen_lower in ['tree nuts', 'nuts']:
+                tree_nuts = ['almond', 'cashew', 'walnut', 'hazelnut', 'pecan', 'pistachio', 'macadamia', 'brazil nut']
+                if any(nut in ingredient_name_lower for nut in tree_nuts):
+                    match_found = True
+                    match_type = 'tree_nut_match'
+                    match_confidence = 0.85
+            
+            elif allergen_lower == 'peanut':
+                if 'peanut' in ingredient_name_lower or 'groundnut' in ingredient_name_lower:
+                    match_found = True
+                    match_type = 'peanut_match'
+                    match_confidence = 0.9
+            
+            # 4. CONSERVATIVE SUBSTRING MATCHING
+            elif len(allergen_lower) > 4:  # Only for longer allergen names
+                if allergen_lower in ingredient_name_lower:
+                    # Additional validation to prevent false matches
+                    if validate_allergen_match(allergen_lower, ingredient_name_lower):
+                        match_found = True
+                        match_type = 'substring_match'
+                        match_confidence = 0.7
+            
+            # Add warning if valid match found
+            if match_found and match_confidence > 0.5:
+                # Adjust confidence based on detection confidence
+                final_confidence = (ingredient['confidence'] + match_confidence) / 2
+                
+                allergen_warnings.append({
+                    'allergen': user_allergy['allergen_name'],
+                    'ingredient': ingredient['name'],
+                    'confidence': final_confidence,
+                    'match_confidence': match_confidence,
+                    'severity': user_allergy['severity'],
+                    'match_type': match_type,
+                    'bbox': ingredient.get('bbox'),
+                    'detection_method': ingredient.get('detection_type', 'unknown'),
+                    'model_source': ingredient.get('model_source', 'unknown')
+                })
+    
+    # Remove duplicate warnings
+    seen = set()
+    unique_warnings = []
+    for warning in allergen_warnings:
+        key = (warning['allergen'].lower(), warning['ingredient'].lower())
+        if key not in seen:
+            seen.add(key)
+            unique_warnings.append(warning)
+    
+    return unique_warnings
+
+def multi_model_predict(image, confidence_threshold=0.4):
+    """Enhanced prediction with better confidence handling and duplicate removal"""
     if not models_pipeline:
         raise Exception("Multi-model pipeline not loaded")
     
     combined_predictions = {}
+    model_results = {}
     
     for model_info in models_pipeline:
+        model_name = model_info['name']
         try:
             if model_info['specialty'] == 'yolov8_paneer':
-                # YOLOv8 Object Detection
+                # YOLOv8 Object Detection with better confidence handling
                 yolo_detector = model_info['model']
                 detections = yolo_detector.detect_ingredients(image)
                 weight = model_info['weight']
                 
+                model_results['yolo'] = len(detections)
+                
                 for detection in detections:
                     ingredient = detection['name']
-                    confidence = detection['confidence'] * weight
+                    confidence = min(detection['confidence'] * weight, 1.0)  # Cap at 100%
                     
-                    # Boost confidence for paneer (main allergen concern)
-                    if 'paneer' in ingredient.lower():
-                        confidence *= 1.2  # 20% boost for paneer detection
+                    # Add stricter confidence threshold for paneer to reduce false positives
+                    if ingredient.lower() == 'paneer' and confidence < 0.8:
+                        print(f"⚠️ Low confidence paneer detection skipped: {confidence:.2f}")
+                        continue
                     
-                    # Keep highest confidence and add detection metadata
-                    if ingredient not in combined_predictions or confidence > combined_predictions[ingredient]['confidence']:
+                    # Only add if confidence is reasonable
+                    if confidence >= confidence_threshold:
                         combined_predictions[ingredient] = {
                             'name': ingredient,
                             'confidence': confidence,
                             'bbox': detection.get('bbox'),
                             'model_source': detection['model_source'],
-                            'detection_type': 'object_detection'
+                            'detection_type': detection['detection_type']
+                        }
+            
+            elif model_info['specialty'] == 'ai_vision':
+                # Gemini Vision AI with better filtering
+                gemini_detector = model_info['model']
+                detections = gemini_detector.detect_ingredients(image)
+                weight = model_info['weight']
+                
+                model_results['gemini'] = len(detections)
+                
+                for detection in detections:
+                    ingredient = detection['name']
+                    confidence = min(detection['confidence'] * weight, 1.0)  # Cap at 100%
+                    
+                    # Skip very low confidence detections
+                    if confidence < 0.4:
+                        continue
+                    
+                    # Special handling for commonly over-detected ingredients
+                    if ingredient.lower() in ['paneer', 'cheese'] and confidence < 0.6:
+                        print(f"⚠️ Low confidence {ingredient} detection skipped: {confidence:.2f}")
+                        continue
+                    
+                    # Avoid duplicates - only add if not detected by YOLOv8 or confidence is significantly higher
+                    if ingredient not in combined_predictions or confidence > combined_predictions[ingredient]['confidence'] + 0.1:
+                        combined_predictions[ingredient] = {
+                            'name': ingredient,
+                            'confidence': confidence,
+                            'category': detection.get('category', 'unknown'),
+                            'model_source': detection['model_source'],
+                            'detection_type': detection['detection_type']
                         }
             
             elif model_info['specialty'] == 'general':
-                # Your existing general food model
+                # General model with conservative approach
                 model = model_info['model']
                 ingredients = model_info['ingredients']
                 weight = model_info['weight']
                 
-                # Preprocess image for your existing model
+                # Preprocess image
                 transform = transforms.Compose([
                     transforms.Resize((224, 224)),
                     transforms.ToTensor(),
@@ -268,14 +649,16 @@ def multi_model_predict(image, confidence_threshold=0.3):
                     outputs = model(image_tensor)
                     predictions = outputs.cpu().numpy()[0]
                 
-                detected_indices = np.where(predictions > confidence_threshold)[0]
+                # Use higher threshold for general model to reduce noise
+                detected_indices = np.where(predictions > max(confidence_threshold, 0.5))[0]
+                model_results['general'] = len(detected_indices)
                 
                 for idx in detected_indices:
                     if idx < len(ingredients):
                         ingredient = ingredients[idx]
-                        confidence = float(predictions[idx]) * weight
+                        confidence = min(float(predictions[idx]) * weight, 1.0)
                         
-                        # Only add if not already detected by YOLOv8 or confidence is higher
+                        # Only add if not already detected with higher confidence
                         if ingredient not in combined_predictions or confidence > combined_predictions[ingredient]['confidence']:
                             combined_predictions[ingredient] = {
                                 'name': ingredient,
@@ -285,14 +668,38 @@ def multi_model_predict(image, confidence_threshold=0.3):
                             }
                             
         except Exception as e:
-            print(f"Error in model {model_info['name']}: {e}")
+            print(f"Error in model {model_name}: {e}")
+            model_results[model_name.split('_')[0]] = 0
             continue
     
     # Convert to list and sort by confidence
     detected_ingredients = list(combined_predictions.values())
     detected_ingredients.sort(key=lambda x: x['confidence'], reverse=True)
     
-    return detected_ingredients[:25]  # Top 25 ingredients
+    # Remove very similar ingredients to reduce duplicates
+    filtered_ingredients = []
+    for ingredient in detected_ingredients:
+        ingredient_name = ingredient['name'].lower()
+        
+        # Check if similar ingredient already exists
+        is_duplicate = False
+        for existing in filtered_ingredients:
+            existing_name = existing['name'].lower()
+            
+            # Check for obvious duplicates or very similar names
+            if (ingredient_name == existing_name or 
+                (len(ingredient_name) > 4 and ingredient_name in existing_name) or
+                (len(existing_name) > 4 and existing_name in ingredient_name)):
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            filtered_ingredients.append(ingredient)
+    
+    print(f"🔍 Model Results: {model_results}")
+    print(f"🧹 Filtered {len(detected_ingredients) - len(filtered_ingredients)} duplicate ingredients")
+    
+    return filtered_ingredients[:25]  # Top 25 unique ingredients
 
 # MongoDB Helper Functions
 def get_user_allergies(user_id):
@@ -313,16 +720,21 @@ def save_scan_to_history(user_id, detected_ingredients, allergen_warnings, is_sa
     result = scan_history_collection.insert_one(scan_doc)
     return str(result.inserted_id)
 
-
 @app.route('/')
 def health_check():
     """Health check endpoint for Render and keep-alive"""
+    gemini_available = any(model.get('specialty') == 'ai_vision' for model in models_pipeline)
+    yolo_available = any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline)
+    
     return jsonify({
         'status': 'healthy',
-        'message': 'FoodGuard API backend is running',
+        'message': 'FoodGuard API backend with Gemini AI is running',
         'models_loaded': len(models_pipeline),
         'mongodb_connected': True,
-        'yolov8_available': any(model.get('specialty') == 'yolov8_paneer' for model in models_pipeline),
+        'yolov8_available': yolo_available,
+        'gemini_available': gemini_available,
+        'ai_enhanced': gemini_available,
+        'fixes_applied': 'false_positive_reduction',
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -332,7 +744,6 @@ def register():
     try:
         data = request.get_json()
         print(f"📝 Registration attempt for: {data.get('email', 'unknown')}")
-        print(f"📝 Request data: {data}")
         
         required_fields = ['email', 'password', 'first_name', 'last_name']
         if not all(field in data for field in required_fields):
@@ -347,11 +758,10 @@ def register():
         email = data['email'].lower().strip()
         print(f"📧 Processing email: {email}")
         
-        # Check if user already exists with detailed logging
+        # Check if user already exists
         existing_user = users_collection.find_one({"email": email})
         if existing_user:
             print(f"❌ Email already exists: {email}")
-            print(f"❌ Existing user ID: {existing_user['_id']}")
             return jsonify({'error': 'Email already registered'}), 409
         
         # Create user document
@@ -365,9 +775,7 @@ def register():
             "is_active": True
         }
         
-        print(f"💾 Attempting to save user document: {user_doc['email']}")
-        
-        # Insert user into MongoDB with detailed error handling
+        # Insert user into MongoDB
         try:
             result = users_collection.insert_one(user_doc)
             user_id = str(result.inserted_id)
@@ -378,15 +786,6 @@ def register():
         except Exception as e:
             print(f"❌ Database insert error: {e}")
             return jsonify({'error': f'Database error: {str(e)}'}), 500
-        
-        # Verify user was actually saved
-        saved_user = users_collection.find_one({"_id": result.inserted_id})
-        if not saved_user:
-            print(f"❌ User verification failed for {email}")
-            return jsonify({'error': 'User creation verification failed'}), 500
-        
-        print(f"✅ User verification successful: {saved_user['email']}")
-        print(f"✅ Saved user document: {saved_user}")
         
         # Create access token
         access_token = create_access_token(identity=user_id)
@@ -407,9 +806,6 @@ def register():
         
     except Exception as e:
         print(f"❌ Unexpected registration error: {str(e)}")
-        print(f"❌ Error type: {type(e)}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': f'Registration failed: {str(e)}'}), 500
 
 @app.route('/api/auth/login', methods=['POST'])
@@ -531,12 +927,12 @@ def analyze_food():
         # Load user's allergies from MongoDB
         user_allergies = get_user_allergies(user_id)
         
-        # Save temporary image for YOLOv8 processing
+        # Save temporary image for processing
         temp_filename = f"temp_{user_id}_{int(time.time())}.jpg"
         image_file.save(temp_filename)
         
         try:
-            # Process with multi-model pipeline (YOLOv8 + fallback)
+            # Process with enhanced multi-model pipeline (YOLOv8 + Gemini + fallback)
             detected_ingredients = multi_model_predict(temp_filename)
         finally:
             # Clean up temporary file
@@ -549,77 +945,19 @@ def analyze_food():
                 'ingredients': [],
                 'allergen_warnings': [],
                 'is_safe': True,
-                'message': 'No ingredients detected. Try a clearer image.',
+                'message': 'No ingredients detected. Try a clearer image or different angle.',
                 'user_allergies_count': len(user_allergies)
             })
         
-        # Enhanced allergen matching
-        allergen_warnings = []
-        for ingredient in detected_ingredients:
-            ingredient_name_lower = ingredient['name'].lower()
-            
-            for user_allergy in user_allergies:
-                allergen_lower = user_allergy['allergen_name'].lower()
-                
-                # Enhanced matching for paneer/dairy
-                paneer_variants = ['paneer', 'cottage cheese', 'indian cheese', 'fresh cheese']
-                dairy_terms = ['dairy', 'milk', 'cheese', 'curd', 'butter']
-                
-                # Check for paneer variants
-                if allergen_lower == 'paneer' and any(variant in ingredient_name_lower for variant in paneer_variants):
-                    allergen_warnings.append({
-                        'allergen': user_allergy['allergen_name'],
-                        'ingredient': ingredient['name'],
-                        'confidence': ingredient['confidence'],
-                        'severity': user_allergy['severity'],
-                        'match_type': 'paneer_variant',
-                        'bbox': ingredient.get('bbox'),
-                        'detection_method': ingredient.get('detection_type', 'unknown')
-                    })
-                    continue
-                
-                # Check for dairy terms
-                if any(dairy_term in allergen_lower for dairy_term in dairy_terms) and 'paneer' in ingredient_name_lower:
-                    allergen_warnings.append({
-                        'allergen': user_allergy['allergen_name'],
-                        'ingredient': ingredient['name'],
-                        'confidence': ingredient['confidence'],
-                        'severity': user_allergy['severity'],
-                        'match_type': 'dairy_match',
-                        'bbox': ingredient.get('bbox'),
-                        'detection_method': ingredient.get('detection_type', 'unknown')
-                    })
-                    continue
-                
-                # Standard matching
-                if (allergen_lower in ingredient_name_lower or 
-                    ingredient_name_lower in allergen_lower or
-                    any(word in ingredient_name_lower.split() for word in allergen_lower.split())):
-                    
-                    allergen_warnings.append({
-                        'allergen': user_allergy['allergen_name'],
-                        'ingredient': ingredient['name'],
-                        'confidence': ingredient['confidence'],
-                        'severity': user_allergy['severity'],
-                        'match_type': 'standard',
-                        'bbox': ingredient.get('bbox'),
-                        'detection_method': ingredient.get('detection_type', 'unknown')
-                    })
+        # Enhanced allergen matching with fixed logic
+        allergen_warnings = enhanced_allergen_matching(detected_ingredients, user_allergies)
         
-        # Remove duplicates
-        seen = set()
-        unique_warnings = []
-        for warning in allergen_warnings:
-            key = (warning['allergen'], warning['ingredient'])
-            if key not in seen:
-                seen.add(key)
-                unique_warnings.append(warning)
-        
-        allergen_warnings = unique_warnings
         avg_confidence = np.mean([ing['confidence'] for ing in detected_ingredients]) if detected_ingredients else 0.0
         
-        # Count YOLOv8 detections
+        # Count detections by model type
         yolo_detections = len([ing for ing in detected_ingredients if ing.get('detection_type') == 'object_detection'])
+        gemini_detections = len([ing for ing in detected_ingredients if 'gemini' in ing.get('model_source', '')])
+        general_detections = len([ing for ing in detected_ingredients if ing.get('model_source') == 'general_food_model'])
         
         # Save scan to MongoDB history
         scan_id = save_scan_to_history(
@@ -638,9 +976,15 @@ def analyze_food():
             'confidence_score': float(avg_confidence),
             'user_allergies_count': len(user_allergies),
             'models_used': len(models_pipeline),
-            'yolo_detections': yolo_detections,
-            'total_detections': len(detected_ingredients),
-            'message': 'YOLOv8 enhanced multi-model analysis completed'
+            'model_breakdown': {
+                'yolov8_detections': yolo_detections,
+                'gemini_detections': gemini_detections,
+                'general_detections': general_detections,
+                'total_detections': len(detected_ingredients)
+            },
+            'message': 'Enhanced YOLOv8 + Gemini AI + General Model analysis completed',
+            'ai_enhanced': gemini_detections > 0,
+            'false_positive_reduction': True
         })
         
     except Exception as e:
@@ -692,14 +1036,18 @@ def pipeline_status():
                 'name': model_info['name'],
                 'weight': model_info['weight'],
                 'specialty': model_info['specialty'],
-                'ingredients_count': len(model_info['ingredients']) if 'ingredients' in model_info else 0
+                'ingredients_count': len(model_info['ingredients']) if isinstance(model_info.get('ingredients'), list) else 'dynamic'
             } for model_info in models_pipeline
         ],
         'device': str(device),
-        'yolov8_available': any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline)
+        'yolov8_available': any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline),
+        'gemini_available': any(model['specialty'] == 'ai_vision' for model in models_pipeline),
+        'general_model_available': any(model['specialty'] == 'general' for model in models_pipeline),
+        'false_positive_fixes': True,
+        'enhanced_allergen_matching': True
     })
 
-# Add to your Flask app
+# Debug endpoints
 @app.route('/api/debug/db-info')
 def debug_db_info():
     return jsonify({
@@ -709,7 +1057,6 @@ def debug_db_info():
         'server_info': client.server_info()['version']
     })
 
-# Add debugging endpoint to check database status
 @app.route('/api/debug/users-count', methods=['GET'])
 def debug_users_count():
     try:
@@ -730,7 +1077,6 @@ def debug_users_count():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Add comprehensive database verification endpoint
 @app.route('/api/debug/db-verify', methods=['GET'])
 def debug_db_verify():
     try:
@@ -775,31 +1121,41 @@ def debug_db_verify():
             'collections': collections_info,
             'write_test': 'successful',
             'connection_string_set': bool(os.getenv('MONGODB_URI')),
+            'gemini_api_key_set': bool(os.getenv('GEMINI_API_KEY')),
             'total_users': users_collection.count_documents({}),
-            'indexes_created': True
+            'indexes_created': True,
+            'false_positive_fixes': True
         })
         
     except Exception as e:
         return jsonify({
             'mongodb_status': 'error',
             'error': str(e),
-            'connection_string_set': bool(os.getenv('MONGODB_URI'))
+            'connection_string_set': bool(os.getenv('MONGODB_URI')),
+            'gemini_api_key_set': bool(os.getenv('GEMINI_API_KEY'))
         }), 500
 
 def initialize_app():
-    """Initialize MongoDB connections and load YOLOv8 multi-model pipeline"""
+    """Initialize MongoDB connections and load enhanced multi-model pipeline"""
     try:
         # Test MongoDB connection
         client.admin.command('ping')
         print("✅ MongoDB connection successful")
         
-        # Load models
+        # Load enhanced pipeline
         pipeline_loaded = load_multi_model_pipeline()
         
         if pipeline_loaded:
-            print("🚀 YOLOv8-Enhanced FoodGuard API Server with MongoDB initialized successfully!")
+            gemini_loaded = any(model['specialty'] == 'ai_vision' for model in models_pipeline)
+            yolo_loaded = any(model['specialty'] == 'yolov8_paneer' for model in models_pipeline)
+            
+            print("🚀 Enhanced FoodGuard API Server initialized successfully!")
+            print(f"   - YOLOv8 Loaded: {'✅' if yolo_loaded else '❌'}")
+            print(f"   - Gemini AI Loaded: {'✅' if gemini_loaded else '❌'}")
+            print(f"   - Total Models: {len(models_pipeline)}")
+            print(f"   - False Positive Fixes: ✅")
         else:
-            print("⚠️  Server started but YOLOv8 model may not be loaded.")
+            print("⚠️  Server started but some models may not be loaded.")
             
     except Exception as e:
         print(f"❌ Initialization error: {e}")
@@ -807,14 +1163,25 @@ def initialize_app():
 if __name__ == '__main__':
     initialize_app()
     
-    print("🍽️ MongoDB-Enhanced FoodGuard API Server Starting...")
-    print("📝 Required files:")
+    print("🍽️ Enhanced FoodGuard API Server with False Positive Fixes Starting...")
+    print("📝 Required files and environment variables:")
     print("   - best.pt (YOLOv8 model)")
-    print("   - MongoDB connection string in MONGODB_URI environment variable")
+    print("   - MONGODB_URI (MongoDB connection string)")
+    print("   - GEMINI_API_KEY (Google Gemini AI API key)")
+    print("   - JWT_SECRET_KEY (for authentication)")
     print()
-    print("🎯 YOLOv8 Model Performance: mAP50 = 76.8%")
-    print("🔍 Detection capabilities: Paneer + Mint with bounding boxes")
-    print("🍃 Database: MongoDB with collections: users, allergies, scan_history")
+    print("🎯 Enhanced Model Pipeline:")
+    print("   1. YOLOv8: Stricter paneer detection (80% threshold)")
+    print("   2. Gemini AI: Conservative ingredient identification")
+    print("   3. General Model: Fallback classification")
+    print()
+    print("🔧 Key Fixes Applied:")
+    print("   ✅ Fixed 'cheese detected in ghee' false positive")
+    print("   ✅ Reduced paneer over-detection with higher thresholds")
+    print("   ✅ Enhanced allergen matching specificity")
+    print("   ✅ Confidence capping (max 100%)")
+    print("   ✅ Better duplicate ingredient filtering")
+    print("   ✅ Invalid allergen match prevention")
     print()
     
     port = int(os.environ.get('PORT', 5000))
