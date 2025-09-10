@@ -126,9 +126,9 @@ class GeminiIngredientDetector:
             # Specialized prompt for comprehensive ingredient detection
             prompt = """
             Analyze this food image and identify ALL visible ingredients, components, and food items with high accuracy.
-            
+
             IMPORTANT: Only identify ingredients you can clearly see. Do not guess or assume.
-            
+
             Focus on detecting:
             1. Primary ingredients (proteins like paneer, chicken, mutton, fish, eggs)
             2. Dairy products (milk, cheese, butter, ghee, yogurt, cream)
@@ -138,25 +138,46 @@ class GeminiIngredientDetector:
             6. Nuts and seeds (almonds, cashews, sesame, etc.)
             7. Spices and herbs (turmeric, cumin, coriander, mint, cilantro, etc.)
             8. Oils and fats
-            
+
             Be very specific and conservative:
             - Only report what you can actually see in the image
             - Don't identify paneer unless you're absolutely certain it's visible
             - Be specific: if you see ghee, say "ghee" not "butter"
             - If you see specific vegetables, name them individually
             - Use confidence scores between 0.5-0.95 (be realistic)
-            
+
+            For each ingredient detected, also provide estimated nutritional information per 100g:
+            - Calories (kcal)
+            - Protein (g)
+            - Carbohydrates (g)
+            - Fat (g)
+            - Fiber (g)
+            - Key vitamins and minerals if significant
+
             Return your response as a JSON array in this exact format:
             [
-                {"name": "ingredient_name", "confidence": 0.85, "category": "protein"},
-                {"name": "another_ingredient", "confidence": 0.75, "category": "dairy"}
+                {
+                    "name": "ingredient_name",
+                    "confidence": 0.85,
+                    "category": "protein",
+                    "nutrition": {
+                        "calories": 265,
+                        "protein": 18.3,
+                        "carbs": 1.2,
+                        "fat": 20.8,
+                        "fiber": 0.0,
+                        "vitamins": {"A": 500, "C": 0},
+                        "minerals": {"calcium": 208, "iron": 0.4, "sodium": 18}
+                    }
+                }
             ]
-            
+
             Categories: protein, dairy, vegetable, grain, spice, nut, oil, fruit, legume, processed, herb, other
-            
+
             Only return the JSON array, no other text.
             """
-            
+
+
             # Generate content with image
             response = self.model.generate_content([prompt] + image_parts)
             
@@ -190,6 +211,7 @@ class GeminiIngredientDetector:
                             'name': item['name'].lower().strip(),
                             'confidence': confidence,
                             'category': item.get('category', 'unknown'),
+                            'nutrition': item.get('nutrition', {}),
                             'model_source': 'gemini_vision',
                             'detection_type': 'ai_vision_analysis'
                         })
@@ -562,6 +584,7 @@ def multi_model_predict(image, confidence_threshold=0.4):
         raise Exception("Multi-model pipeline not loaded")
     
     combined_predictions = {}
+    nutrition_data = {}
     model_results = {}
     
     for model_info in models_pipeline:
@@ -624,6 +647,13 @@ def multi_model_predict(image, confidence_threshold=0.4):
                             'model_source': detection['model_source'],
                             'detection_type': detection['detection_type']
                         }
+                        # Store nutrition data separately
+                        if detection.get('nutrition'):
+                            nutrition_data[ingredient] = {
+                                'nutrition_per_100g': detection.get('nutrition', {}),
+                                'confidence': confidence,
+                                'source': 'gemini_ai'
+                            }
             
             elif model_info['specialty'] == 'general':
                 # General model with conservative approach
@@ -699,7 +729,7 @@ def multi_model_predict(image, confidence_threshold=0.4):
     print(f"🔍 Model Results: {model_results}")
     print(f"🧹 Filtered {len(detected_ingredients) - len(filtered_ingredients)} duplicate ingredients")
     
-    return filtered_ingredients[:25]  # Top 25 unique ingredients
+    return filtered_ingredients[:25], nutrition_data  # Top 25 unique ingredients
 
 # MongoDB Helper Functions
 def get_user_allergies(user_id):
@@ -707,16 +737,23 @@ def get_user_allergies(user_id):
     allergies = list(allergies_collection.find({"user_id": user_id}))
     return allergies
 
-def save_scan_to_history(user_id, detected_ingredients, allergen_warnings, is_safe, confidence_score):
-    """Save scan to MongoDB history"""
+def save_scan_to_history(user_id, detected_ingredients, nutrition_data, allergen_warnings, is_safe, confidence_score, total_nutrition=None):
+    """Save scan to history"""
     scan_doc = {
         "user_id": user_id,
         "detected_ingredients": detected_ingredients,
+        "nutrition_data": nutrition_data,
         "allergen_warnings": allergen_warnings,
         "is_safe": is_safe,
         "confidence_score": confidence_score,
+        "has_nutrition": bool(nutrition_data),
         "created_at": datetime.utcnow()
     }
+    
+    # Add total nutrition if provided
+    if total_nutrition:
+        scan_doc["total_nutrition"] = total_nutrition
+    
     result = scan_history_collection.insert_one(scan_doc)
     return str(result.inserted_id)
 
@@ -914,7 +951,7 @@ def analyze_food():
     user_id = get_jwt_identity()
     
     if not models_pipeline:
-        return jsonify({'error': 'Multi-model pipeline not available. Please check server logs.'}), 500
+        return jsonify({'error': 'Multi-model pipeline not available'}), 500
     
     if 'image' not in request.files:
         return jsonify({'error': 'No image provided'}), 400
@@ -924,18 +961,16 @@ def analyze_food():
         return jsonify({'error': 'No image selected'}), 400
     
     try:
-        # Load user's allergies from MongoDB
         user_allergies = get_user_allergies(user_id)
         
-        # Save temporary image for processing
         temp_filename = f"temp_{user_id}_{int(time.time())}.jpg"
         image_file.save(temp_filename)
         
         try:
-            # Process with enhanced multi-model pipeline (YOLOv8 + Gemini + fallback)
-            detected_ingredients = multi_model_predict(temp_filename)
+            # Enhanced prediction with nutrition data
+            detected_ingredients, nutrition_data = multi_model_predict(temp_filename)
+            
         finally:
-            # Clean up temporary file
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
         
@@ -943,26 +978,56 @@ def analyze_food():
             return jsonify({
                 'scan_id': None,
                 'ingredients': [],
+                'nutrition': None,
                 'allergen_warnings': [],
                 'is_safe': True,
-                'message': 'No ingredients detected. Try a clearer image or different angle.',
-                'user_allergies_count': len(user_allergies)
+                'message': 'No ingredients detected.'
             })
         
-        # Enhanced allergen matching with fixed logic
+        # Calculate total nutrition
+        total_nutrition = {
+            'calories': 0, 'protein': 0, 'carbs': 0, 'fat': 0, 'fiber': 0,
+            'vitamins': {}, 'minerals': {}
+        }
+        
+        nutrition_confidence_scores = []
+        
+        for ingredient_name, nutrition_info in nutrition_data.items():
+            nutrition = nutrition_info['nutrition_per_100g']
+            
+            # Aggregate nutrition (simple sum - you might want to weight by estimated portions)
+            total_nutrition['calories'] += nutrition.get('calories', 0)
+            total_nutrition['protein'] += nutrition.get('protein', 0)
+            total_nutrition['carbs'] += nutrition.get('carbs', 0)
+            total_nutrition['fat'] += nutrition.get('fat', 0)
+            total_nutrition['fiber'] += nutrition.get('fiber', 0)
+            
+            # Aggregate vitamins and minerals
+            for vitamin, value in nutrition.get('vitamins', {}).items():
+                total_nutrition['vitamins'][vitamin] = total_nutrition['vitamins'].get(vitamin, 0) + value
+            
+            for mineral, value in nutrition.get('minerals', {}).items():
+                total_nutrition['minerals'][mineral] = total_nutrition['minerals'].get(mineral, 0) + value
+            
+            nutrition_confidence_scores.append(nutrition_info['confidence'])
+        
+        # Calculate nutrition confidence
+        avg_nutrition_confidence = (
+            sum(nutrition_confidence_scores) / len(nutrition_confidence_scores)
+            if nutrition_confidence_scores else 0.0
+        )
+        
+        # Existing allergen matching
         allergen_warnings = enhanced_allergen_matching(detected_ingredients, user_allergies)
         
-        avg_confidence = np.mean([ing['confidence'] for ing in detected_ingredients]) if detected_ingredients else 0.0
+        avg_confidence = np.mean([ing['confidence'] for ing in detected_ingredients])
         
-        # Count detections by model type
-        yolo_detections = len([ing for ing in detected_ingredients if ing.get('detection_type') == 'object_detection'])
-        gemini_detections = len([ing for ing in detected_ingredients if 'gemini' in ing.get('model_source', '')])
-        general_detections = len([ing for ing in detected_ingredients if ing.get('model_source') == 'general_food_model'])
-        
-        # Save scan to MongoDB history
+        # Save to history with nutrition
         scan_id = save_scan_to_history(
             user_id=user_id,
             detected_ingredients=detected_ingredients,
+            nutrition_data=nutrition_data,
+            total_nutrition=total_nutrition,
             allergen_warnings=allergen_warnings,
             is_safe=len(allergen_warnings) == 0,
             confidence_score=float(avg_confidence)
@@ -971,25 +1036,31 @@ def analyze_food():
         return jsonify({
             'scan_id': scan_id,
             'ingredients': detected_ingredients,
+            'nutrition': {
+                'individual_ingredients': nutrition_data,
+                'total_estimated': {
+                    'calories': round(total_nutrition['calories'], 1),
+                    'protein': round(total_nutrition['protein'], 1),
+                    'carbs': round(total_nutrition['carbs'], 1),
+                    'fat': round(total_nutrition['fat'], 1),
+                    'fiber': round(total_nutrition['fiber'], 1),
+                    'vitamins': total_nutrition['vitamins'],
+                    'minerals': total_nutrition['minerals']
+                },
+                'confidence': round(avg_nutrition_confidence, 2),
+                'note': 'Nutritional values are AI estimates per 100g of detected ingredients'
+            },
             'allergen_warnings': allergen_warnings,
             'is_safe': len(allergen_warnings) == 0,
             'confidence_score': float(avg_confidence),
-            'user_allergies_count': len(user_allergies),
-            'models_used': len(models_pipeline),
-            'model_breakdown': {
-                'yolov8_detections': yolo_detections,
-                'gemini_detections': gemini_detections,
-                'general_detections': general_detections,
-                'total_detections': len(detected_ingredients)
-            },
-            'message': 'Enhanced YOLOv8 + Gemini AI + General Model analysis completed',
-            'ai_enhanced': gemini_detections > 0,
-            'false_positive_reduction': True
+            'nutrition_available': bool(nutrition_data),
+            'message': 'Enhanced analysis with AI-powered nutritional information'
         })
         
     except Exception as e:
-        print(f"Multi-model analysis error: {e}")
+        print(f"Analysis error: {e}")
         return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
+
 
 @app.route('/api/scan-history', methods=['GET'])
 @jwt_required()
